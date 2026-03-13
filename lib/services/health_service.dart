@@ -5,6 +5,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/health_snapshot.dart';
 import '../models/risk_insight.dart';
 
+// ── Default API config (demo / TestFlight) ───────────────────────────────────
+const kDefaultApiUrl = 'https://lifepulse-api-63410932899.us-central1.run.app';
+const kTenantSlug = 'tikcare';
+
 /// Connection mode: OW = full chain via Open Wearables (unavailable — SDK removed);
 /// Direct = read HealthKit via `health` package, POST to LifePulse Partner API directly.
 enum SyncMode { openWearables, direct }
@@ -37,6 +41,72 @@ class HealthService {
   static const _keyLpUserId = 'lp_user_id';
   static const _keySyncMode = 'sync_mode';
   static const _keyRiskInsightCache = 'risk_insight_cache';
+  static const _keyJwtToken = 'jwt_token';
+  static const _keyLoggedInEmail = 'logged_in_email';
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  static Future<bool> isLoggedIn() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getString(_keyJwtToken) ?? '').isNotEmpty;
+  }
+
+  static Future<String?> getJwtToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_keyJwtToken);
+  }
+
+  static Future<String?> getLoggedInEmail() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_keyLoggedInEmail);
+  }
+
+  static Future<SyncResult> login({
+    required String email,
+    required String password,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final baseUrl = (prefs.getString(_keyLpUrl) ?? kDefaultApiUrl)
+        .trimRight()
+        .replaceAll(RegExp(r'/+$'), '');
+
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/v1/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'tenant_slug': kTenantSlug,
+          'email': email,
+          'password': password,
+        }),
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        final token = body['access_token'] as String;
+        final userId = body['user_id'] as String;
+        await prefs.setString(_keyJwtToken, token);
+        await prefs.setString(_keyLpUserId, userId);
+        await prefs.setString(_keyLoggedInEmail, email);
+        // Ensure the URL is saved as default
+        await prefs.setString(_keyLpUrl, baseUrl);
+        return SyncResult(success: true, message: 'Logged in successfully.');
+      } else if (response.statusCode == 401) {
+        return SyncResult(success: false, message: 'Invalid email or password.');
+      } else {
+        return SyncResult(success: false, message: 'Login failed (HTTP ${response.statusCode}).');
+      }
+    } catch (e) {
+      return SyncResult(success: false, message: 'Cannot reach server: $e');
+    }
+  }
+
+  static Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_keyJwtToken);
+    await prefs.remove(_keyLpUserId);
+    await prefs.remove(_keyLoggedInEmail);
+    await prefs.remove(_keyRiskInsightCache);
+  }
 
   // ── Config accessors ─────────────────────────────────────────────────────
   static Future<SyncMode> getSyncMode() async {
@@ -169,24 +239,26 @@ class HealthService {
     }
   }
 
-  // ── Cloud risk insights (requires network + Partner API) ─────────────────
-  /// Calls GET /partner/v1/users/{id}/summary and parses the HRI + anomalies.
+  // ── Cloud risk insights (requires network + JWT) ──────────────────────────
+  /// Calls GET /api/v1/reports/summary and parses the HRI + anomalies.
   /// Caches the result in SharedPreferences for offline display on next launch.
   static Future<RiskInsight?> fetchRiskInsight({
     void Function(String)? onLog,
   }) async {
-    final cfg = await getConfig();
-    final lpUrl = (cfg['lpUrl'] ?? '').trimRight().replaceAll(RegExp(r'/+$'), '');
-    final lpApiKey = cfg['lpApiKey'] ?? '';
-    final lpUserId = cfg['lpUserId'] ?? '';
+    final prefs = await SharedPreferences.getInstance();
+    final lpUrl = (prefs.getString(_keyLpUrl) ?? kDefaultApiUrl)
+        .trimRight()
+        .replaceAll(RegExp(r'/+$'), '');
+    final lpUserId = prefs.getString(_keyLpUserId) ?? '';
+    final token = prefs.getString(_keyJwtToken) ?? '';
 
-    if (lpUrl.isEmpty || lpApiKey.isEmpty || lpUserId.isEmpty) return null;
+    if (lpUserId.isEmpty || token.isEmpty) return null;
 
     try {
       onLog?.call('Fetching risk insights from TikCare…');
       final response = await http.get(
-        Uri.parse('$lpUrl/partner/v1/users/$lpUserId/summary'),
-        headers: {'X-API-Key': lpApiKey},
+        Uri.parse('$lpUrl/api/v1/reports/summary/$lpUserId'),
+        headers: {'Authorization': 'Bearer $token'},
       ).timeout(const Duration(seconds: 15));
 
       if (response.statusCode != 200) {
@@ -271,20 +343,18 @@ class HealthService {
     }
   }
 
-  // ── Direct sync path ──────────────────────────────────────────────────────
+  // ── Direct sync path (JWT auth) ───────────────────────────────────────────
   static Future<SyncResult> syncDirect({
     void Function(String)? onLog,
   }) async {
-    final cfg = await getConfig();
-    final lpUrl = (cfg['lpUrl'] ?? '').trimRight().replaceAll(RegExp(r'/+$'), '');
-    final lpApiKey = cfg['lpApiKey'] ?? '';
-    final lpUserId = cfg['lpUserId'] ?? '';
+    final prefs = await SharedPreferences.getInstance();
+    final lpUrl = (prefs.getString(_keyLpUrl) ?? kDefaultApiUrl)
+        .trimRight()
+        .replaceAll(RegExp(r'/+$'), '');
+    final token = prefs.getString(_keyJwtToken) ?? '';
 
-    if (lpUrl.isEmpty || lpApiKey.isEmpty || lpUserId.isEmpty) {
-      return SyncResult(
-        success: false,
-        message: 'LifePulse API URL, API Key and User ID must be configured.',
-      );
+    if (token.isEmpty) {
+      return SyncResult(success: false, message: 'Not logged in. Please sign in first.');
     }
 
     try {
@@ -312,33 +382,32 @@ class HealthService {
       }
 
       final events = deduped
-          .map((dp) => _convertToIngestEvent(dp, lpUserId))
+          .map((dp) => _convertToMobileSyncEvent(dp))
           .whereType<Map<String, dynamic>>()
           .toList();
 
-      onLog?.call('POSTing ${events.length} events to LifePulse Partner API…');
+      onLog?.call('POSTing ${events.length} events to LifePulse…');
 
       final response = await http
           .post(
-            Uri.parse('$lpUrl/partner/v1/data/ingest'),
+            Uri.parse('$lpUrl/api/v1/data/mobile-sync'),
             headers: {
               'Content-Type': 'application/json',
-              'X-API-Key': lpApiKey,
+              'Authorization': 'Bearer $token',
             },
-            body: jsonEncode({
-              'user_id': lpUserId,
-              'source': 'apple_health',
-              'events': events,
-            }),
+            body: jsonEncode({'events': events}),
           )
           .timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200 || response.statusCode == 202) {
         final body = jsonDecode(response.body) as Map<String, dynamic>;
         final syncId = body['sync_log_id'] ?? 'unknown';
-        onLog?.call('✅ Ingest accepted. sync_log_id=$syncId');
+        onLog?.call('✅ Sync accepted. sync_log_id=$syncId');
         onLog?.call('Pipeline processing… fetching insights in a moment.');
-        return SyncResult(success: true, message: 'Ingest accepted.', data: body);
+        return SyncResult(success: true, message: 'Sync accepted.', data: body);
+      } else if (response.statusCode == 401) {
+        onLog?.call('❌ Session expired. Please sign in again.');
+        return SyncResult(success: false, message: 'Session expired. Please sign in again.');
       } else {
         onLog?.call('❌ HTTP ${response.statusCode}: ${response.body}');
         return SyncResult(
@@ -353,11 +422,10 @@ class HealthService {
 
   // ── Health check ──────────────────────────────────────────────────────────
   static Future<SyncResult> pingLifePulse() async {
-    final cfg = await getConfig();
-    final lpUrl = (cfg['lpUrl'] ?? '').trimRight().replaceAll(RegExp(r'/+$'), '');
-    if (lpUrl.isEmpty) {
-      return SyncResult(success: false, message: 'LifePulse URL not configured.');
-    }
+    final prefs = await SharedPreferences.getInstance();
+    final lpUrl = (prefs.getString(_keyLpUrl) ?? kDefaultApiUrl)
+        .trimRight()
+        .replaceAll(RegExp(r'/+$'), '');
     try {
       final response = await http
           .get(Uri.parse('$lpUrl/api/v1/health'))
@@ -377,22 +445,14 @@ class HealthService {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
-  static Map<String, dynamic>? _convertToIngestEvent(
-    HealthDataPoint dp,
-    String userId,
-  ) {
+  static Map<String, dynamic>? _convertToMobileSyncEvent(HealthDataPoint dp) {
     final lpMetric = _healthTypeToLp(dp.type);
     if (lpMetric == null) return null;
 
-    double? numericValue;
-    if (dp.value is NumericHealthValue) {
-      numericValue = (dp.value as NumericHealthValue).numericValue.toDouble();
-    } else {
-      return null;
-    }
+    if (dp.value is! NumericHealthValue) return null;
+    final numericValue = (dp.value as NumericHealthValue).numericValue.toDouble();
 
     return {
-      'user_id': userId,
       'metric_type': lpMetric,
       'value': numericValue,
       'unit': _unitForType(dp.type),
