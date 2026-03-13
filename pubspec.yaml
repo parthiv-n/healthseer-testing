@@ -1,0 +1,31 @@
+name: lifepulse_test_app
+description: "TikCare LifePulse – device connection test app (iOS / HealthKit)"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.6.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # Official health package — HealthKit (iOS) + Health Connect (Android)
+  health: ^12.0.0
+
+  # Persistent storage for API config
+  shared_preferences: ^2.2.3
+
+  # HTTP client for direct Partner API calls (bypass mode)
+  http: ^1.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/tikcare_logo.jpeg
