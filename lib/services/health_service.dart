@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -501,7 +502,7 @@ class HealthService {
       'start_time': dp.dateFrom.toUtc().toIso8601String(),
       'end_time': dp.dateTo.toUtc().toIso8601String(),
       'source_device': dp.sourceName,
-      'source_platform': 'HEALTHKIT',
+      'source_platform': Platform.isIOS ? 'HEALTHKIT' : 'HEALTH_CONNECT',
     };
   }
 
