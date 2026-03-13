@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import '../services/health_service.dart';
 
 const _navy = Color(0xFF1B3A6B);
-const _navyLight = Color(0xFF2A5298);
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -168,7 +167,17 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
               ),
 
-              const SizedBox(height: 32),
+              const SizedBox(height: 20),
+              Center(
+                child: TextButton(
+                  onPressed: () => Navigator.pushNamed(context, '/register'),
+                  child: const Text(
+                    'New tester? Create an account',
+                    style: TextStyle(fontSize: 13, color: _navy),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
               const Center(
                 child: Text(
                   'Your data is encrypted and only shared\nwith your insurance provider.',

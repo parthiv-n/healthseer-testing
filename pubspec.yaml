@@ -20,6 +20,9 @@ dependencies:
   # HTTP client for direct Partner API calls (bypass mode)
   http: ^1.2.1
 
+  # Background sync (iOS Background Fetch / Android WorkManager)
+  workmanager: ^0.7.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

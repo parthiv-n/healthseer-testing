@@ -100,6 +100,48 @@ class HealthService {
     }
   }
 
+  static Future<SyncResult> register({
+    required String email,
+    required String password,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final baseUrl = (prefs.getString(_keyLpUrl) ?? kDefaultApiUrl)
+        .trimRight()
+        .replaceAll(RegExp(r'/+$'), '');
+
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/v1/auth/register'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'tenant_slug': kTenantSlug,
+          'email': email,
+          'password': password,
+        }),
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 201) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        final token = body['access_token'] as String;
+        final userId = body['user_id'] as String;
+        await prefs.setString(_keyJwtToken, token);
+        await prefs.setString(_keyLpUserId, userId);
+        await prefs.setString(_keyLoggedInEmail, email);
+        await prefs.setString(_keyLpUrl, baseUrl);
+        return SyncResult(success: true, message: 'Account created successfully.');
+      } else if (response.statusCode == 409) {
+        return SyncResult(success: false, message: 'Email already registered. Please sign in.');
+      } else if (response.statusCode == 400) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        return SyncResult(success: false, message: body['detail'] as String? ?? 'Registration failed.');
+      } else {
+        return SyncResult(success: false, message: 'Registration failed (HTTP ${response.statusCode}).');
+      }
+    } catch (e) {
+      return SyncResult(success: false, message: 'Cannot reach server: $e');
+    }
+  }
+
   static Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_keyJwtToken);

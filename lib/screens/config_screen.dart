@@ -60,7 +60,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
     );
     if (confirmed == true && mounted) {
       await HealthService.logout();
-      Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
+      if (mounted) Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
     }
   }
 
