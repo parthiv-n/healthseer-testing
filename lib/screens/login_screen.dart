@@ -37,6 +37,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
     if (!mounted) return;
     if (result.success) {
+      await HealthService.registerBackgroundSync();
+      if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/home');
     } else {
       setState(() { _loading = false; _error = result.message; });
@@ -56,18 +58,18 @@ class _LoginScreenState extends State<LoginScreen> {
               // Logo + title
               Center(
                 child: ClipRRect(
-                  borderRadius: BorderRadius.circular(18),
+                  borderRadius: BorderRadius.circular(12),
                   child: Image.asset(
                     'assets/tikcare_logo.jpeg',
-                    width: 72,
-                    height: 72,
-                    fit: BoxFit.cover,
+                    width: 200,
+                    height: 60,
+                    fit: BoxFit.contain,
                     errorBuilder: (_, __, ___) => Container(
-                      width: 72,
-                      height: 72,
+                      width: 200,
+                      height: 60,
                       decoration: BoxDecoration(
                         color: _navy,
-                        borderRadius: BorderRadius.circular(18),
+                        borderRadius: BorderRadius.circular(12),
                       ),
                       child: const Icon(Icons.favorite, color: Colors.white, size: 36),
                     ),

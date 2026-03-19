@@ -51,6 +51,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
     if (!mounted) return;
     if (result.success) {
+      await HealthService.registerBackgroundSync();
+      if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/home');
     } else {
       setState(() { _loading = false; _error = result.message; });

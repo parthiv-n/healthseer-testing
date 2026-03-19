@@ -5,6 +5,15 @@ import '../services/health_service.dart';
 import '../models/health_snapshot.dart';
 import '../models/risk_insight.dart';
 
+// ── Cache banner helper ────────────────────────────────────────────────────────
+String _relativeTime(DateTime dt) {
+  final diff = DateTime.now().difference(dt);
+  if (diff.inMinutes < 2) return 'just now';
+  if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+  if (diff.inHours < 24) return '${diff.inHours}h ago';
+  return '${diff.inDays}d ago';
+}
+
 // ── Color palette ─────────────────────────────────────────────────────────────
 const _navy = Color(0xFF1B3A6B);
 const _navyLight = Color(0xFF2A5298);
@@ -22,11 +31,12 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final List<_LogEntry> _logs = [];
   bool _syncing = false;
   bool? _apiOnline;
   bool _logsExpanded = false;
+  bool _showDebugLog = false;
 
   // ── Local health snapshot ────────────────────────────────────────────────
   HealthSnapshot? _snapshot;
@@ -40,6 +50,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   String? _lastSyncTime;
   int? _lastEventCount;
   bool? _lastSyncSuccess;
+  SyncErrorType? _lastSyncErrorType;
+
+  // ── Offline cache state ───────────────────────────────────────────────────
+  bool _insightFromCache = false;
+  DateTime? _insightCachedAt;
 
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
@@ -58,12 +73,53 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _checkApi();
     _loadLocalSnapshot();
     _loadCachedInsight();
+    _loadDebugLogPref();
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pulseCtrl.dispose();
     super.dispose();
+  }
+
+  /// Trigger a silent background sync whenever the app comes back to foreground,
+  /// but only if it's been more than 30 minutes since the last sync.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !_syncing) {
+      _maybeSyncOnResume();
+    }
+  }
+
+  Future<void> _maybeSyncOnResume() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastTime = prefs.getString('last_sync_time');
+    final lastSuccess = prefs.getBool('last_sync_success') ?? false;
+    // Only auto-sync if last sync was successful or never happened
+    if (!lastSuccess && lastTime != null) return;
+
+    // Check anchor timestamp to avoid syncing too frequently
+    final anchor = prefs.getString('last_sync_anchor_ts');
+    if (anchor != null) {
+      final last = DateTime.tryParse(anchor);
+      if (last != null && DateTime.now().difference(last).inMinutes < 30) return;
+    }
+
+    // Silent background sync — no UI disruption
+    HealthService.syncDirect().then((result) async {
+      if (result.success && mounted) {
+        final prefs2 = await SharedPreferences.getInstance();
+        await prefs2.setString('last_sync_anchor_ts', DateTime.now().toIso8601String());
+        _loadCachedInsight();
+      }
+    });
+  }
+
+  Future<void> _loadDebugLogPref() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) setState(() => _showDebugLog = prefs.getBool('show_debug_log') ?? false);
   }
 
   Future<void> _loadLocalSnapshot() async {
@@ -74,7 +130,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Future<void> _loadCachedInsight() async {
     final cached = await HealthService.fetchRiskInsight();
-    if (mounted && cached != null) setState(() => _insight = cached);
+    if (mounted && cached != null) {
+      final now = DateTime.now();
+      final isFromCache = now.difference(cached.fetchedAt).inSeconds > 30;
+      setState(() {
+        _insight = cached;
+        _insightFromCache = isFromCache;
+        _insightCachedAt = cached.fetchedAt;
+      });
+    }
   }
 
   Future<void> _loadLastSync() async {
@@ -138,7 +202,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _addLog(result.success ? LogLevel.ok : LogLevel.error, result.message);
 
     if (mounted) {
-      setState(() { _syncing = false; _logsExpanded = true; });
+      setState(() {
+        _syncing = false;
+        _logsExpanded = true;
+        _lastSyncErrorType = result.errorType;
+      });
       if (result.success) {
         HapticFeedback.heavyImpact();
         // Fetch cloud insights shortly after sync (pipeline needs a moment)
@@ -192,6 +260,24 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     subtitle: 'from TikCare',
                   ),
                   const SizedBox(height: 8),
+                  // Cache banner
+                  if (_insightFromCache && _insightCachedAt != null) ...[
+                    _CacheBanner(
+                      cachedAt: _insightCachedAt!,
+                      onTap: _runSync,
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  // Error banner (when no cached data either)
+                  if (!_syncing && _insight == null && _lastSyncErrorType != null) ...[
+                    _ErrorBanner(
+                      errorType: _lastSyncErrorType!,
+                      onSignIn: () => Navigator.pushNamedAndRemoveUntil(
+                        context, '/login', (_) => false,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   _RiskInsightsCard(
                     insight: _insight,
                     loading: _loadingInsight,
@@ -218,14 +304,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       success: _lastSyncSuccess ?? false,
                     ),
                   const SizedBox(height: 8),
-                  _WhatWeSyncChips(),
+                  const _WhatWeSyncChips(),
                   const SizedBox(height: 12),
-                  _LogSection(
-                    logs: _logs,
-                    expanded: _logsExpanded,
-                    onToggle: () => setState(() => _logsExpanded = !_logsExpanded),
-                    onClear: () => setState(() => _logs.clear()),
-                  ),
+                  if (_showDebugLog)
+                    _LogSection(
+                      logs: _logs,
+                      expanded: _logsExpanded,
+                      onToggle: () => setState(() => _logsExpanded = !_logsExpanded),
+                      onClear: () => setState(() => _logs.clear()),
+                    ),
                 ],
               ),
             ),
@@ -255,25 +342,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: Image.asset(
-                      'assets/tikcare_logo.jpeg',
-                      width: 44,
-                      height: 44,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: Colors.white24,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(Icons.favorite, color: Colors.white, size: 24),
-                      ),
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
                     ),
+                    child: const Icon(Icons.favorite, color: Colors.white, size: 20),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 10),
                   const Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -374,11 +452,11 @@ class _HealthTodayGrid extends StatelessWidget {
           padding: const EdgeInsets.all(4),
           child: Row(
             children: [
-              const Icon(Icons.info_outline, size: 16, color: Colors.grey),
+              const Icon(Icons.watch_outlined, size: 16, color: Colors.grey),
               const SizedBox(width: 8),
               const Expanded(
                 child: Text(
-                  'No HealthKit data for today. Open the Health app to check permissions.',
+                  'No health data yet today.\nWear your device and check back later.',
                   style: TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ),
@@ -398,17 +476,17 @@ class _HealthTodayGrid extends StatelessWidget {
         children: [
           Row(
             children: [
-              Expanded(child: _MetricTile(label: 'Avg HR', value: s.avgHr != null ? '${s.avgHr!.toInt()} bpm' : '—', icon: '❤️')),
+              Expanded(child: _MetricTile(label: 'Avg HR', value: s.avgHr != null ? '${s.avgHr!.toInt()} bpm' : '—', icon: Icons.favorite, iconColor: Colors.red.shade400)),
               const SizedBox(width: 8),
-              Expanded(child: _MetricTile(label: 'Steps', value: s.steps != null ? _formatSteps(s.steps!) : '—', icon: '🦶')),
+              Expanded(child: _MetricTile(label: 'Steps', value: s.steps != null ? _formatSteps(s.steps!) : '—', icon: Icons.directions_walk, iconColor: _navy)),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(child: _MetricTile(label: 'Sleep', value: s.sleepHours != null ? '${s.sleepHours!.toStringAsFixed(1)}h' : '—', icon: '😴')),
+              Expanded(child: _MetricTile(label: 'Sleep', value: s.sleepHours != null ? '${s.sleepHours!.toStringAsFixed(1)}h' : '—', icon: Icons.bedtime_outlined, iconColor: Colors.indigo.shade400)),
               const SizedBox(width: 8),
-              Expanded(child: _MetricTile(label: 'HRV', value: s.hrv != null ? '${s.hrv!.toInt()} ms' : '—', icon: '💙')),
+              Expanded(child: _MetricTile(label: 'HRV', value: s.hrv != null ? '${s.hrv!.toInt()} ms' : '—', icon: Icons.monitor_heart_outlined, iconColor: Colors.blue.shade400)),
             ],
           ),
           const SizedBox(height: 6),
@@ -443,8 +521,9 @@ class _HealthTodayGrid extends StatelessWidget {
 class _MetricTile extends StatelessWidget {
   final String label;
   final String value;
-  final String icon;
-  const _MetricTile({required this.label, required this.value, required this.icon});
+  final IconData icon;
+  final Color iconColor;
+  const _MetricTile({required this.label, required this.value, required this.icon, this.iconColor = _navy});
 
   @override
   Widget build(BuildContext context) {
@@ -457,7 +536,7 @@ class _MetricTile extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(icon, style: const TextStyle(fontSize: 18)),
+          Icon(icon, size: 20, color: iconColor),
           const SizedBox(height: 4),
           Text(
             value,
@@ -543,7 +622,7 @@ class _RiskInsightsCard extends StatelessWidget {
     }
 
     final s = insight!;
-    final hriColor = _hriColor(s.hriLabel);
+    final hriColor = _hriColor(s.hriLabel, score: s.hriScore);
 
     return Column(
       children: [
@@ -565,7 +644,7 @@ class _RiskInsightsCard extends StatelessWidget {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Text(
-                      '${s.hriScore}',
+                      s.hriScore > 0 ? '${s.hriScore}' : '--',
                       style: TextStyle(
                         fontSize: 22,
                         fontWeight: FontWeight.w800,
@@ -590,7 +669,7 @@ class _RiskInsightsCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      _hriDescription(s.hriLabel),
+                      _hriDescription(s.hriLabel, score: s.hriScore),
                       style: TextStyle(fontSize: 12, color: hriColor, fontWeight: FontWeight.w500),
                     ),
                     const SizedBox(height: 4),
@@ -660,7 +739,8 @@ class _RiskInsightsCard extends StatelessWidget {
     );
   }
 
-  Color _hriColor(String label) {
+  Color _hriColor(String label, {int score = 1}) {
+    if (score == 0) return Colors.grey;
     return switch (label) {
       'critical' => _red,
       'high' => _orange,
@@ -669,7 +749,8 @@ class _RiskInsightsCard extends StatelessWidget {
     };
   }
 
-  String _hriDescription(String label) {
+  String _hriDescription(String label, {int score = 1}) {
+    if (score == 0) return 'Awaiting sufficient health data';
     return switch (label) {
       'critical' => 'Critical — immediate review recommended',
       'high' => 'Elevated — monitor closely',
@@ -882,27 +963,56 @@ class _SyncButton extends StatelessWidget {
 // ── What We Sync Chips ────────────────────────────────────────────────────────
 
 class _WhatWeSyncChips extends StatelessWidget {
-  final _metrics = const [
-    ('❤️', 'Heart Rate'), ('💙', 'HRV'), ('🦶', 'Steps'),
-    ('🩸', 'Blood O₂'), ('🔥', 'Energy'), ('😴', 'Resting HR'),
+  static const _metrics = [
+    (Icons.favorite, 'Heart Rate'),
+    (Icons.monitor_heart, 'HRV'),
+    (Icons.directions_walk, 'Steps'),
+    (Icons.water_drop, 'Blood O₂'),
+    (Icons.local_fire_department, 'Active Energy'),
+    (Icons.bedtime_outlined, 'Resting HR'),
+    (Icons.route_outlined, 'Distance'),
+    (Icons.stairs, 'Floors Climbed'),
+    (Icons.timer_outlined, 'Exercise Time'),
+    (Icons.bolt, 'Basal Energy'),
+    (Icons.bedtime, 'Sleep'),
+    (Icons.air, 'Resp. Rate*'),
   ];
+
+  const _WhatWeSyncChips();
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 6,
-      runSpacing: 4,
-      children: _metrics.map((m) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: const Color(0xFFEEF2FF),
-          borderRadius: BorderRadius.circular(16),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 6,
+          runSpacing: 4,
+          children: _metrics.map((m) => Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFFEEF2FF),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(m.$1, size: 12, color: _navy),
+                const SizedBox(width: 4),
+                Text(
+                  m.$2,
+                  style: const TextStyle(fontSize: 11, color: _navy, fontWeight: FontWeight.w500),
+                ),
+              ],
+            ),
+          )).toList(),
         ),
-        child: Text(
-          '${m.$1} ${m.$2}',
-          style: const TextStyle(fontSize: 11, color: _navy, fontWeight: FontWeight.w500),
+        const SizedBox(height: 4),
+        const Text(
+          '* Respiratory Rate requires Apple Watch Series 6 or later.',
+          style: TextStyle(fontSize: 10, color: Colors.grey),
         ),
-      )).toList(),
+      ],
     );
   }
 }
@@ -1065,6 +1175,124 @@ class _LogLine extends StatelessWidget {
               style: TextStyle(fontSize: 10, color: color, fontFamily: 'monospace'),
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Cache Banner ───────────────────────────────────────────────────────────────
+
+class _CacheBanner extends StatelessWidget {
+  final DateTime cachedAt;
+  final VoidCallback onTap;
+  const _CacheBanner({required this.cachedAt, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: Colors.amber.shade50,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.amber.shade300),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.cloud_off_outlined, size: 15, color: Colors.amber.shade700),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Showing cached data from ${_relativeTime(cachedAt)} — tap to sync',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.amber.shade800,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+            Icon(Icons.chevron_right, size: 16, color: Colors.amber.shade600),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Error Banner ───────────────────────────────────────────────────────────────
+
+class _ErrorBanner extends StatelessWidget {
+  final SyncErrorType errorType;
+  final VoidCallback onSignIn;
+  const _ErrorBanner({required this.errorType, required this.onSignIn});
+
+  @override
+  Widget build(BuildContext context) {
+    final (msg, icon, color) = switch (errorType) {
+      SyncErrorType.network => (
+          'No connection. Showing last saved data.',
+          Icons.wifi_off_outlined,
+          Colors.orange,
+        ),
+      SyncErrorType.serverError => (
+          'Server error. Try again later.',
+          Icons.cloud_off_outlined,
+          Colors.orange,
+        ),
+      SyncErrorType.authExpired => (
+          'Session expired. Please sign in again.',
+          Icons.lock_outline,
+          Colors.red,
+        ),
+      SyncErrorType.noData => (
+          'No data available for this period.',
+          Icons.inbox_outlined,
+          Colors.grey,
+        ),
+      _ => (
+          'An error occurred. Try syncing again.',
+          Icons.error_outline,
+          Colors.orange,
+        ),
+    };
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              msg,
+              style: TextStyle(
+                fontSize: 12,
+                color: color,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          if (errorType == SyncErrorType.authExpired)
+            GestureDetector(
+              onTap: onSignIn,
+              child: Text(
+                'Sign in',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: color,
+                  fontWeight: FontWeight.w700,
+                  decoration: TextDecoration.underline,
+                ),
+              ),
+            ),
         ],
       ),
     );
