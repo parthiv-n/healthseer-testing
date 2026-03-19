@@ -31,12 +31,14 @@ class DimensionScore {
   final String label;
   final double confidence;
   final List<String> drivers;
+  final List<String> metricsUsed;
 
   DimensionScore({
     required this.score,
     required this.label,
     required this.confidence,
     required this.drivers,
+    this.metricsUsed = const [],
   });
 
   factory DimensionScore.fromJson(Map<String, dynamic> j) => DimensionScore(
@@ -44,6 +46,7 @@ class DimensionScore {
         label: j['label'] as String? ?? 'unknown',
         confidence: (j['confidence'] as num?)?.toDouble() ?? 0.0,
         drivers: (j['drivers'] as List<dynamic>?)?.cast<String>() ?? [],
+        metricsUsed: (j['metrics_used'] as List<dynamic>?)?.cast<String>() ?? [],
       );
 }
 
@@ -92,6 +95,8 @@ class DailyReport {
   final String hriTrendDir;
   final List<MetricSummary> metrics;
   final Map<String, DimensionScore> dimensions;
+  final double? compositeScore;
+  final String? compositeLabel;
   final HealthScores? healthScores;
   // Baseline maturity fields (v2.6)
   final String baselineMaturity;   // "cold_start" | "developing" | "established"
@@ -115,6 +120,8 @@ class DailyReport {
     required this.hriTrendDir,
     required this.metrics,
     required this.dimensions,
+    this.compositeScore,
+    this.compositeLabel,
     this.healthScores,
     this.baselineMaturity = 'cold_start',
     this.avgConfidence = 0.0,
@@ -132,6 +139,8 @@ class DailyReport {
         dims[k] = DimensionScore.fromJson(dimsJson[k] as Map<String, dynamic>);
       }
     }
+    final compositeScore = (dimsJson['composite'] as num?)?.toDouble();
+    final compositeLabel = dimsJson['composite_label'] as String?;
 
     final metricsJson = j['metrics'] as List<dynamic>? ?? [];
 
@@ -150,6 +159,8 @@ class DailyReport {
       hriTrendDir: j['hri_trend_dir'] as String? ?? 'stable',
       metrics: metricsJson.map((e) => MetricSummary.fromJson(e as Map<String, dynamic>)).toList(),
       dimensions: dims,
+      compositeScore: compositeScore,
+      compositeLabel: compositeLabel,
       healthScores: j['health_scores'] != null
           ? HealthScores.fromJson(j['health_scores'] as Map<String, dynamic>)
           : null,

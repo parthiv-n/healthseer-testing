@@ -4,6 +4,7 @@ import 'home_screen.dart';
 import 'trends_screen.dart';
 import 'alerts_screen.dart';
 import 'profile_screen.dart';
+import 'risk_domains_screen.dart';
 
 const _navy = Color(0xFF1B3A6B);
 
@@ -32,6 +33,7 @@ class _MainTabScreenState extends State<MainTabScreen> {
       HomeScreen(prefs: widget.prefs),
       const TrendsScreen(),
       const AlertsScreen(),
+      const RiskDomainsScreen(),
       ProfileScreen(prefs: widget.prefs),
     ];
 
@@ -60,7 +62,8 @@ class _MainTabScreenState extends State<MainTabScreen> {
                 _NavItem(icon: Icons.favorite_border, activeIcon: Icons.favorite, label: 'Today', index: 0, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
                 _NavItem(icon: Icons.show_chart_outlined, activeIcon: Icons.show_chart, label: 'Trends', index: 1, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
                 _NavItem(icon: Icons.notifications_outlined, activeIcon: Icons.notifications, label: 'Alerts', index: 2, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
-                _NavItem(icon: Icons.person_outline, activeIcon: Icons.person, label: 'Profile', index: 3, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
+                _NavItem(icon: Icons.analytics_outlined, activeIcon: Icons.analytics, label: 'Risk', index: 3, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
+                _NavItem(icon: Icons.person_outline, activeIcon: Icons.person, label: 'Profile', index: 4, currentIndex: _currentIndex, onTap: (i) => setState(() => _currentIndex = i)),
               ],
             ),
           ),
