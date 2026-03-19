@@ -36,7 +36,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   bool _syncing = false;
   bool? _apiOnline;
   bool _logsExpanded = false;
-  bool _showDebugLog = false;
 
   // ── Local health snapshot ────────────────────────────────────────────────
   HealthSnapshot? _snapshot;
@@ -73,7 +72,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _checkApi();
     _loadLocalSnapshot();
     _loadCachedInsight();
-    _loadDebugLogPref();
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -115,11 +113,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         _loadCachedInsight();
       }
     });
-  }
-
-  Future<void> _loadDebugLogPref() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (mounted) setState(() => _showDebugLog = prefs.getBool('show_debug_log') ?? false);
   }
 
   Future<void> _loadLocalSnapshot() async {
@@ -306,13 +299,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   const SizedBox(height: 8),
                   const _WhatWeSyncChips(),
                   const SizedBox(height: 12),
-                  if (_showDebugLog)
-                    _LogSection(
-                      logs: _logs,
-                      expanded: _logsExpanded,
-                      onToggle: () => setState(() => _logsExpanded = !_logsExpanded),
-                      onClear: () => setState(() => _logs.clear()),
-                    ),
                 ],
               ),
             ),

@@ -208,7 +208,7 @@ class _AnomalyCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final color = _severityColor;
     final dt = anomaly.eventTimestamp;
-    final dateStr = '${dt.month}/${dt.day} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    final dateStr = '${dt.month.toString().padLeft(2, '0')}/${dt.day.toString().padLeft(2, '0')} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -254,7 +254,7 @@ class _AnomalyCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  '${anomaly.value.toStringAsFixed(1)} ${anomaly.metricUnit}  ·  z=${anomaly.zScore.toStringAsFixed(1)}σ',
+                  '${anomaly.value.toStringAsFixed(1)} ${anomaly.metricUnit}  ·  ${anomaly.zScore > 0 ? '↑ Higher' : '↓ Lower'} than usual',
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                 ),
                 if (anomaly.explanation.isNotEmpty) ...[

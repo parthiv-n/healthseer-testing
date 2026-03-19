@@ -141,7 +141,7 @@ class AnomalyDetailScreen extends StatelessWidget {
     final color = _severityColor;
     final dt = anomaly.eventTimestamp;
     final dateStr =
-        '${dt.month}/${dt.day}/${dt.year} '
+        '${dt.month.toString().padLeft(2, '0')}/${dt.day.toString().padLeft(2, '0')}/${dt.year} '
         '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
     return Scaffold(
@@ -265,10 +265,10 @@ class AnomalyDetailScreen extends StatelessWidget {
                             const SizedBox(width: 12),
                             Expanded(
                               child: _ValueTile(
-                                label: 'z-score',
-                                value: anomaly.zScore.toStringAsFixed(2),
-                                unit: '\u03c3',
-                                color: Colors.grey.shade600,
+                                label: 'Direction',
+                                value: anomaly.zScore > 0 ? '↑ High' : '↓ Low',
+                                unit: '',
+                                color: anomaly.zScore > 0 ? const Color(0xFFE53E3E) : const Color(0xFF2563EB),
                               ),
                             ),
                             const SizedBox(width: 12),
@@ -414,13 +414,13 @@ class AnomalyDetailScreen extends StatelessWidget {
   }
 
   String _severityDescription(String severity, double z) {
+    final direction = z > 0 ? 'above' : 'below';
     return switch (severity) {
-      'severe' => 'Severe (|z| \u2265 6.5\u03c3) — this reading is far outside your personal '
-          'baseline and warrants close attention.',
-      'moderate' => 'Moderate (4.5 \u2264 |z| < 6.5\u03c3) — this reading is notably outside '
-          'your typical range.',
-      _ => 'Mild (3.0 \u2264 |z| < 4.5\u03c3) — this reading is slightly outside your '
-          'personal baseline. Monitor over the next few hours.',
+      'severe' => 'Severe — this reading is well $direction your personal baseline '
+          'and warrants close attention.',
+      'moderate' => 'Moderate — this reading is notably $direction your typical range.',
+      _ => 'Mild — this reading is slightly $direction your personal baseline. '
+          'Monitor over the next few hours.',
     };
   }
 
