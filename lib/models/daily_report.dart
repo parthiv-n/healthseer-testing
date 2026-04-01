@@ -1,4 +1,35 @@
 /// Data models for the daily health report from GET /reports/daily/{user_id}
+
+/// HRV Unified Score — cross-device, cross-method index (0–100).
+/// Bridges HRV_SDNN (Apple Watch) and HRV_RMSSD (Samsung/Garmin/Fitbit)
+/// into a single score comparable regardless of which device the user wears.
+class HrvUnifiedScore {
+  final double score;
+  final String label;
+  final double confidence;
+  final String methodUsed;
+  final String trendDirection;
+  final String explanation;
+
+  HrvUnifiedScore({
+    required this.score,
+    required this.label,
+    required this.confidence,
+    required this.methodUsed,
+    required this.trendDirection,
+    required this.explanation,
+  });
+
+  factory HrvUnifiedScore.fromJson(Map<String, dynamic> j) => HrvUnifiedScore(
+        score: (j['score'] as num?)?.toDouble() ?? 0.0,
+        label: j['label'] as String? ?? 'unknown',
+        confidence: (j['confidence'] as num?)?.toDouble() ?? 0.0,
+        methodUsed: j['method_used'] as String? ?? 'none',
+        trendDirection: j['trend_direction'] as String? ?? 'stable',
+        explanation: j['explanation'] as String? ?? '',
+      );
+}
+
 class MetricSummary {
   final String metricType;
   final int count;
@@ -45,8 +76,8 @@ class DimensionScore {
         score: (j['score'] as num?)?.toDouble() ?? 0.0,
         label: j['label'] as String? ?? 'unknown',
         confidence: (j['confidence'] as num?)?.toDouble() ?? 0.0,
-        drivers: (j['drivers'] as List<dynamic>?)?.cast<String>() ?? [],
-        metricsUsed: (j['metrics_used'] as List<dynamic>?)?.cast<String>() ?? [],
+        drivers: (j['drivers'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
+        metricsUsed: (j['metrics_used'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
       );
 }
 
@@ -57,6 +88,8 @@ class HealthScores {
   final double? consistencyScore;
   final double? intensityScore;
   final double? recoveryScore;
+  // HRV Unified Score — cross-device index (added v2.7)
+  final HrvUnifiedScore? hrvUnified;
 
   HealthScores({
     this.hrvTrendScore,
@@ -65,17 +98,27 @@ class HealthScores {
     this.consistencyScore,
     this.intensityScore,
     this.recoveryScore,
+    this.hrvUnified,
   });
 
   factory HealthScores.fromJson(Map<String, dynamic> j) {
     final dims = j['activity_dimensions'] as Map<String, dynamic>?;
+    // hrv_score is the legacy trend score; hrv_unified is the new cross-device score
+    final hrvScoreMap = j['hrv_score'] as Map<String, dynamic>?;
+    final hrvUnifiedMap = j['hrv_unified'] as Map<String, dynamic>?;
+    final activityMap = j['activity_score'] as Map<String, dynamic>?;
     return HealthScores(
-      hrvTrendScore: (j['hrv_trend_score'] as num?)?.toDouble(),
-      activityWellnessScore: (j['activity_wellness_score'] as num?)?.toDouble(),
+      hrvTrendScore: (hrvScoreMap?['score'] as num?)?.toDouble()
+          ?? (j['hrv_trend_score'] as num?)?.toDouble(),
+      activityWellnessScore: (activityMap?['score'] as num?)?.toDouble()
+          ?? (j['activity_wellness_score'] as num?)?.toDouble(),
       volumeScore: (dims?['volume'] as num?)?.toDouble(),
       consistencyScore: (dims?['consistency'] as num?)?.toDouble(),
       intensityScore: (dims?['intensity'] as num?)?.toDouble(),
       recoveryScore: (dims?['recovery_time'] as num?)?.toDouble(),
+      hrvUnified: hrvUnifiedMap != null
+          ? HrvUnifiedScore.fromJson(hrvUnifiedMap)
+          : null,
     );
   }
 }
