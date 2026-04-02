@@ -52,6 +52,13 @@ List<HealthDataType> _platformSyncTypes() {
       HealthDataType.FLIGHTS_CLIMBED,
       HealthDataType.EXERCISE_TIME,
       HealthDataType.BASAL_ENERGY_BURNED,
+      // Sleep stages (v13+: granular DEEP/REM/LIGHT stages from Apple Watch)
+      HealthDataType.SLEEP_IN_BED,
+      HealthDataType.SLEEP_ASLEEP,
+      HealthDataType.SLEEP_DEEP,
+      HealthDataType.SLEEP_REM,
+      HealthDataType.SLEEP_LIGHT,
+      HealthDataType.SLEEP_AWAKE,
     ];
   } else {
     return const [
@@ -65,6 +72,12 @@ List<HealthDataType> _platformSyncTypes() {
       HealthDataType.FLIGHTS_CLIMBED,
       HealthDataType.EXERCISE_TIME,
       HealthDataType.BASAL_ENERGY_BURNED,
+      // Sleep stages (Health Connect)
+      HealthDataType.SLEEP_SESSION,
+      HealthDataType.SLEEP_DEEP,
+      HealthDataType.SLEEP_REM,
+      HealthDataType.SLEEP_LIGHT,
+      HealthDataType.SLEEP_AWAKE,
     ];
   }
 }
@@ -72,22 +85,23 @@ List<HealthDataType> _platformSyncTypes() {
 /// Optional types only available on newer hardware or specific accessories.
 /// Fetched separately with null-safe handling — missing data is silently ignored.
 ///
-/// Blood pressure: requires a 3rd-party BP cuff app writing to HealthKit
-///   (e.g. Withings, Omron). Apple Watch does NOT measure BP directly.
+/// Optional types requiring newer hardware or accessories (fetched separately,
+/// silently skipped when unavailable).
 ///
-/// VO2MAX: changes very slowly (weeks/months) — collected in the normal batch
-///   window just like all other metrics. Works on Apple Watch Series 3+.
-///   Note: enum is HealthDataType.VO2MAX (no underscore), maps to ml/kg/min.
+/// Blood pressure: needs a 3rd-party BP cuff app writing to HealthKit.
+/// WALKING_SPEED: Apple Watch Series 3+, added in health v13.1.0 (iOS only).
+/// APPLE_STAND_TIME: added in health v13.1.1 (iOS only).
 ///
-/// NOT available in health package v12.x (no enum constant):
+/// NOT available in health package v13.x:
+///   - VO2MAX (HKQuantityTypeIdentifierVO2Max) — not wrapped yet; file export only.
 ///   - SLEEP_APNEA_EVENT (HKCategoryTypeIdentifierApneaEvents) — category type,
-///     not wrapped by health package. Requires native platform channel or file export.
-///   - APPLE_STAND_TIME, WALKING_SPEED — not in HealthDataType enum.
+///     not wrapped; file export only (Apple Watch S9+, watchOS 10+).
 const _optionalSyncTypes = [
   HealthDataType.RESPIRATORY_RATE,
   HealthDataType.BLOOD_PRESSURE_SYSTOLIC,
   HealthDataType.BLOOD_PRESSURE_DIASTOLIC,
-  HealthDataType.VO2MAX,
+  HealthDataType.WALKING_SPEED,
+  HealthDataType.APPLE_STAND_TIME,
 ];
 
 
@@ -382,12 +396,9 @@ class HealthService {
         return false; // Caller should surface the install prompt to the user.
       }
     }
-    // Request ALL types that _doSyncDirect() uses — core + sleep + optional.
-    // If we only request core types here, the user would miss granting sleep
-    // and respiratory permissions, causing silent data gaps during sync.
+    // Request ALL types that _doSyncDirect() uses — core (includes sleep stages) + optional.
     final coreTypes = _platformSyncTypes();
-    final sleepType = Platform.isIOS ? HealthDataType.SLEEP_IN_BED : HealthDataType.SLEEP_SESSION;
-    final allTypes = [...coreTypes, sleepType, ..._optionalSyncTypes];
+    final allTypes = [...coreTypes, ..._optionalSyncTypes];
     return await Health().requestAuthorization(allTypes);
   }
 
@@ -468,8 +479,13 @@ class HealthService {
       final hrvType = Platform.isIOS
           ? HealthDataType.HEART_RATE_VARIABILITY_SDNN
           : HealthDataType.HEART_RATE_VARIABILITY_RMSSD;
-      // Fetch day metrics and sleep in parallel — independent queries.
-      // Each wrapped in catchError so a failure in one doesn't discard the other.
+      // Fetch day metrics and sleep in a single parallel batch.
+      // Sleep types use extended window (yesterday 18:00 → now).
+      final sleepTypes = Platform.isIOS
+          ? const [HealthDataType.SLEEP_IN_BED, HealthDataType.SLEEP_ASLEEP,
+                   HealthDataType.SLEEP_DEEP, HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT]
+          : const [HealthDataType.SLEEP_SESSION, HealthDataType.SLEEP_DEEP,
+                   HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT];
       final results = await Future.wait([
         Health().getHealthDataFromTypes(
           types: [HealthDataType.HEART_RATE, hrvType, HealthDataType.STEPS],
@@ -477,7 +493,7 @@ class HealthService {
           endTime: now,
         ).catchError((_) => <HealthDataPoint>[]),
         Health().getHealthDataFromTypes(
-          types: [Platform.isIOS ? HealthDataType.SLEEP_IN_BED : HealthDataType.SLEEP_SESSION],
+          types: sleepTypes,
           startTime: sleepStart,
           endTime: now,
         ).catchError((_) => <HealthDataPoint>[]),
@@ -803,9 +819,9 @@ class HealthService {
       }
 
       // ── Step 2: Request permissions ───────────────────────────────────────
+      // Sleep stages are now in coreTypes (added directly to _platformSyncTypes).
       final coreTypes = _platformSyncTypes();
-      final sleepType = Platform.isIOS ? HealthDataType.SLEEP_IN_BED : HealthDataType.SLEEP_SESSION;
-      final allTypes = [...coreTypes, sleepType, ..._optionalSyncTypes];
+      final allTypes = [...coreTypes, ..._optionalSyncTypes];
 
       onLog?.call(Platform.isIOS ? 'Requesting HealthKit permissions…' : 'Requesting Health Connect permissions…');
       final granted = await Health().requestAuthorization(allTypes);
@@ -819,11 +835,12 @@ class HealthService {
         );
       }
 
-      // ── Step 3–5: Fetch core, sleep, optional metrics in parallel ────────
+      // ── Step 3–5: Fetch core (includes sleep stages), optional in parallel ─
       onLog?.call('Fetching health data…');
 
       // Sleep spans midnight: always look back to yesterday 18:00 at minimum,
-      // but respect the incremental startTime if it's earlier.
+      // but respect the incremental startTime if it's earlier. Sleep stage types
+      // are now in coreTypes, so the same extended window applies to all core data.
       final sleepWindowStart = [
         startTime,
         DateTime(endTime.year, endTime.month, endTime.day)
@@ -833,12 +850,7 @@ class HealthService {
       final fetchResults = await Future.wait([
         Health().getHealthDataFromTypes(
           types: coreTypes,
-          startTime: startTime,
-          endTime: endTime,
-        ),
-        Health().getHealthDataFromTypes(
-          types: [sleepType],
-          startTime: sleepWindowStart,
+          startTime: sleepWindowStart, // use extended window for all (covers sleep)
           endTime: endTime,
         ),
         // Optional types may fail on unsupported devices — catch inline.
@@ -853,7 +865,6 @@ class HealthService {
       final allPoints = Health().removeDuplicates([
         ...fetchResults[0],
         ...fetchResults[1],
-        ...fetchResults[2],
       ]);
       onLog?.call('Fetched ${allPoints.length} data points.');
 
@@ -1030,8 +1041,7 @@ class HealthService {
     if (lpMetric == null) return null;
 
     double numericValue;
-    if (dp.type == HealthDataType.SLEEP_IN_BED ||
-        dp.type == HealthDataType.SLEEP_SESSION) {
+    if (_isSleepType(dp.type)) {
       // Sleep events represent a time range — convert duration to minutes.
       numericValue = dp.dateTo.difference(dp.dateFrom).inSeconds / 60.0;
       if (numericValue <= 0) return null;
@@ -1049,9 +1059,9 @@ class HealthService {
     } else if (lpMetric == 'HRV_RMSSD') {
       algoMeta = {'hrv_method': 'RMSSD', 'source_algorithm': 'HealthConnect'};
     } else if (lpMetric == 'SLEEP_STAGE') {
-      algoMeta = {'staging_algorithm': 'watchOS_sleep'};
-    } else if (lpMetric == 'VO2_MAX') {
-      algoMeta = {'source_algorithm': 'HealthKit_VO2Max'};
+      // Encode the specific sleep stage type so backend can do granular analysis
+      final stageName = dp.type.name; // e.g. "SLEEP_DEEP", "SLEEP_REM"
+      algoMeta = {'staging_algorithm': 'watchOS_sleep', 'sleep_stage': stageName};
     }
 
     return {
@@ -1066,7 +1076,21 @@ class HealthService {
     };
   }
 
+  static bool _isSleepType(HealthDataType type) => const {
+    HealthDataType.SLEEP_IN_BED,
+    HealthDataType.SLEEP_ASLEEP,
+    HealthDataType.SLEEP_DEEP,
+    HealthDataType.SLEEP_REM,
+    HealthDataType.SLEEP_LIGHT,
+    HealthDataType.SLEEP_AWAKE,
+    HealthDataType.SLEEP_AWAKE_IN_BED,
+    HealthDataType.SLEEP_SESSION,
+  }.contains(type);
+
   static String? _healthTypeToLp(HealthDataType type) {
+    // All sleep stage types map to SLEEP_STAGE — duration in minutes.
+    if (_isSleepType(type)) return 'SLEEP_STAGE';
+
     const map = {
       // Core metrics
       HealthDataType.HEART_RATE: 'HR_INSTANT',
@@ -1081,19 +1105,18 @@ class HealthService {
       HealthDataType.FLIGHTS_CLIMBED: 'FLOORS_CLIMBED',
       HealthDataType.EXERCISE_TIME: 'EXERCISE_TIME',
       HealthDataType.BASAL_ENERGY_BURNED: 'ENERGY_BASAL',
-      // Sleep (duration computed from time range)
-      HealthDataType.SLEEP_IN_BED: 'SLEEP_STAGE',    // iOS
-      HealthDataType.SLEEP_SESSION: 'SLEEP_STAGE',   // Android
-      // Optional (Apple Watch S6+ / 3rd-party accessories)
+      // Optional (Apple Watch S6+ / v13 new types)
       HealthDataType.RESPIRATORY_RATE: 'RESP_RATE',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'BP_SYSTOLIC',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'BP_DIASTOLIC',
-      HealthDataType.VO2MAX: 'VO2_MAX',
+      HealthDataType.WALKING_SPEED: 'WALKING_SPEED',
+      HealthDataType.APPLE_STAND_TIME: 'STAND_TIME',
     };
     return map[type];
   }
 
   static String _unitForType(HealthDataType type) {
+    if (_isSleepType(type)) return 'min';
     const map = {
       HealthDataType.HEART_RATE: 'bpm',
       HealthDataType.HEART_RATE_VARIABILITY_SDNN: 'ms',
@@ -1107,14 +1130,12 @@ class HealthService {
       HealthDataType.FLIGHTS_CLIMBED: 'count',
       HealthDataType.EXERCISE_TIME: 'min',
       HealthDataType.BASAL_ENERGY_BURNED: 'kcal',
-      // Sleep
-      HealthDataType.SLEEP_IN_BED: 'min',
-      HealthDataType.SLEEP_SESSION: 'min',
       // Optional
       HealthDataType.RESPIRATORY_RATE: 'breaths/min',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'mmHg',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'mmHg',
-      HealthDataType.VO2MAX: 'ml/kg/min',
+      HealthDataType.WALKING_SPEED: 'm/s',
+      HealthDataType.APPLE_STAND_TIME: 'min',
     };
     return map[type] ?? 'unknown';
   }

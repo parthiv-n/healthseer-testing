@@ -13,9 +13,42 @@ const _bgSyncTask = 'lifepulse.periodicSync';
 /// Called by WorkManager in a separate Dart isolate — must be a top-level function.
 @pragma('vm:entry-point')
 void callbackDispatcher() {
+  // Required: initialise platform-channel binding before any plugin (Health,
+  // FlutterSecureStorage) is used from this background isolate.
+  WidgetsFlutterBinding.ensureInitialized();
   Workmanager().executeTask((task, inputData) async {
+    // health package v13 requires configure() before any HealthKit/HC call.
+    await HealthService.ensureHealthConfigured();
+
     if (task == _bgSyncTask) {
-      await HealthService.syncDirect();
+      // If the user logged out, stop scheduling background syncs rather than
+      // retrying indefinitely with no credentials (wastes battery + backoff slots).
+      // Wrapped in try/catch: Keychain reads can fail in background isolates
+      // if the device has not been unlocked since reboot.
+      try {
+        final loggedIn = await HealthService.isLoggedIn();
+        if (!loggedIn) {
+          await Workmanager().cancelByUniqueName('periodicHealthSync');
+          return true; // success = no retry
+        }
+      } catch (_) {
+        return false; // retry later when device is unlocked
+      }
+      // Skip if a foreground sync completed recently (static fields don't
+      // share across Dart isolates, so we use a SharedPreferences timestamp).
+      if (await HealthService.isSyncRecentlyActive(minutes: 5)) {
+        return true; // no-op — foreground already synced
+      }
+      try {
+        // maxDays: 2 — iOS background tasks are killed after ~30 seconds.
+        // Capping the sync window to 2 days ensures we always finish in time.
+        // Full 180-day first syncs happen in the foreground only.
+        await HealthService.syncDirect(maxDays: 2);
+      } catch (_) {
+        // Swallow exceptions so WorkManager marks the task failed (not crashed)
+        // and schedules a retry instead of terminating the background process.
+        return false;
+      }
     }
     return true;
   });
@@ -23,6 +56,12 @@ void callbackDispatcher() {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // health package v13 requires configure() before any HealthKit/HC call.
+  // Use HealthService's guard so the static flag is set, preventing a
+  // redundant second configure() when HealthService methods are called later.
+  await HealthService.ensureHealthConfigured();
+
   final prefs = await SharedPreferences.getInstance();
 
   await Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
@@ -67,13 +106,12 @@ class TikCareLifePulseApp extends StatelessWidget {
       // Show onboarding if first launch; otherwise go to splash → login/home
       home: onboardingDone ? const SplashScreen() : const OnboardingScreen(),
       routes: {
-        '/': (ctx) => const SplashScreen(),
         '/onboarding': (ctx) => const OnboardingScreen(),
         '/login': (ctx) => const LoginScreen(),
         '/register': (ctx) => const RegisterScreen(),
         '/home': (ctx) => MainTabScreen(prefs: prefs),
-        // Legacy route kept for compat
-        '/config': (ctx) => MainTabScreen(prefs: prefs, initialTab: 3),
+        // Legacy route: redirect to Profile tab
+        '/config': (ctx) => MainTabScreen(prefs: prefs, initialTab: 4),
       },
     );
   }
