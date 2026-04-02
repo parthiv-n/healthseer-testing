@@ -75,16 +75,19 @@ List<HealthDataType> _platformSyncTypes() {
 /// Blood pressure: requires a 3rd-party BP cuff app writing to HealthKit
 ///   (e.g. Withings, Omron). Apple Watch does NOT measure BP directly.
 ///
+/// VO2MAX: changes very slowly (weeks/months) — collected in the normal batch
+///   window just like all other metrics. Works on Apple Watch Series 3+.
+///   Note: enum is HealthDataType.VO2MAX (no underscore), maps to ml/kg/min.
+///
 /// NOT available in health package v12.x (no enum constant):
-///   - VO2_MAX / VO2MAX — not in HealthDataType enum (file export only)
-///   - APPLE_STAND_TIME — not in HealthDataType enum
-///   - WALKING_SPEED — not in HealthDataType enum
-///   - APNEA_EVENTS — category type, not supported by health package (file export only)
-/// These metrics can only be ingested via file export (Apple Health ZIP) or Partner API.
+///   - SLEEP_APNEA_EVENT (HKCategoryTypeIdentifierApneaEvents) — category type,
+///     not wrapped by health package. Requires native platform channel or file export.
+///   - APPLE_STAND_TIME, WALKING_SPEED — not in HealthDataType enum.
 const _optionalSyncTypes = [
   HealthDataType.RESPIRATORY_RATE,
   HealthDataType.BLOOD_PRESSURE_SYSTOLIC,
   HealthDataType.BLOOD_PRESSURE_DIASTOLIC,
+  HealthDataType.VO2MAX,
 ];
 
 
@@ -1047,6 +1050,8 @@ class HealthService {
       algoMeta = {'hrv_method': 'RMSSD', 'source_algorithm': 'HealthConnect'};
     } else if (lpMetric == 'SLEEP_STAGE') {
       algoMeta = {'staging_algorithm': 'watchOS_sleep'};
+    } else if (lpMetric == 'VO2_MAX') {
+      algoMeta = {'source_algorithm': 'HealthKit_VO2Max'};
     }
 
     return {
@@ -1083,6 +1088,7 @@ class HealthService {
       HealthDataType.RESPIRATORY_RATE: 'RESP_RATE',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'BP_SYSTOLIC',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'BP_DIASTOLIC',
+      HealthDataType.VO2MAX: 'VO2_MAX',
     };
     return map[type];
   }
@@ -1108,6 +1114,7 @@ class HealthService {
       HealthDataType.RESPIRATORY_RATE: 'breaths/min',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'mmHg',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'mmHg',
+      HealthDataType.VO2MAX: 'ml/kg/min',
     };
     return map[type] ?? 'unknown';
   }
