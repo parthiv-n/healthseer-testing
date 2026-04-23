@@ -40,18 +40,16 @@ class SyncResult {
 /// Core health types supported on all devices (Apple Watch S1+ / most Android).
 /// iOS uses HRV_SDNN; Android Health Connect uses HRV_RMSSD.
 List<HealthDataType> _platformSyncTypes() {
+  // v3.0: removed ACTIVE_ENERGY_BURNED, DISTANCE_WALKING_RUNNING,
+  // FLIGHTS_CLIMBED, BASAL_ENERGY_BURNED (low actuarial value, no backend mapping).
   if (Platform.isIOS) {
     return const [
       HealthDataType.HEART_RATE,
       HealthDataType.HEART_RATE_VARIABILITY_SDNN,
       HealthDataType.STEPS,
       HealthDataType.BLOOD_OXYGEN,
-      HealthDataType.ACTIVE_ENERGY_BURNED,
       HealthDataType.RESTING_HEART_RATE,
-      HealthDataType.DISTANCE_WALKING_RUNNING,
-      HealthDataType.FLIGHTS_CLIMBED,
       HealthDataType.EXERCISE_TIME,
-      HealthDataType.BASAL_ENERGY_BURNED,
       // Sleep stages (v13+: granular DEEP/REM/LIGHT stages from Apple Watch)
       HealthDataType.SLEEP_IN_BED,
       HealthDataType.SLEEP_ASLEEP,
@@ -66,12 +64,8 @@ List<HealthDataType> _platformSyncTypes() {
       HealthDataType.HEART_RATE_VARIABILITY_RMSSD,
       HealthDataType.STEPS,
       HealthDataType.BLOOD_OXYGEN,
-      HealthDataType.ACTIVE_ENERGY_BURNED,
       HealthDataType.RESTING_HEART_RATE,
-      HealthDataType.DISTANCE_WALKING_RUNNING,
-      HealthDataType.FLIGHTS_CLIMBED,
       HealthDataType.EXERCISE_TIME,
-      HealthDataType.BASAL_ENERGY_BURNED,
       // Sleep stages (Health Connect)
       HealthDataType.SLEEP_SESSION,
       HealthDataType.SLEEP_DEEP,
@@ -96,12 +90,13 @@ List<HealthDataType> _platformSyncTypes() {
 ///   - VO2MAX (HKQuantityTypeIdentifierVO2Max) — not wrapped yet; file export only.
 ///   - SLEEP_APNEA_EVENT (HKCategoryTypeIdentifierApneaEvents) — category type,
 ///     not wrapped; file export only (Apple Watch S9+, watchOS 10+).
+// v3.0: removed WALKING_SPEED and APPLE_STAND_TIME (no backend mapping).
+// v3.2: added ATRIAL_FIBRILLATION_BURDEN (iOS 16+, Apple Watch) → AFIB_FLAG.
 const _optionalSyncTypes = [
   HealthDataType.RESPIRATORY_RATE,
   HealthDataType.BLOOD_PRESSURE_SYSTOLIC,
   HealthDataType.BLOOD_PRESSURE_DIASTOLIC,
-  HealthDataType.WALKING_SPEED,
-  HealthDataType.APPLE_STAND_TIME,
+  HealthDataType.ATRIAL_FIBRILLATION_BURDEN,
 ];
 
 
@@ -134,6 +129,10 @@ class HealthService {
   /// Fires `true` whenever any API call returns HTTP 401.
   /// Screens can listen and route the user to the login screen.
   static final sessionExpired = ValueNotifier<bool>(false);
+
+  /// Progress label for chunked historical re-sync ("Week 3 of 52").
+  /// Null when no historical sync is running.
+  static final historicalSyncProgress = ValueNotifier<String?>(null);
 
   // ── Preference keys ──────────────────────────────────────────────────────
   static const _keyOwUrl = 'ow_api_url';
@@ -241,7 +240,9 @@ class HealthService {
         }),
       ).timeout(const Duration(seconds: 30));
 
-      if (response.statusCode == 201) {
+      if (response.statusCode == 403) {
+        return SyncResult(success: false, message: 'Registration is currently disabled. Please contact your administrator.');
+      } else if (response.statusCode == 201) {
         final decoded = jsonDecode(response.body);
         if (decoded is! Map<String, dynamic>) {
           return SyncResult(success: false, message: 'Unexpected server response. Please try again.');
@@ -275,6 +276,80 @@ class HealthService {
       return SyncResult(success: false, message: 'Connection timed out. Please check your network and try again.');
     } catch (e) {
       debugPrint('[HealthService.register] $e');
+      return SyncResult(success: false, message: 'Unable to connect. Please check your internet connection.');
+    }
+  }
+
+  /// Request a password reset token for [email].
+  static Future<SyncResult> requestPasswordReset({
+    required String email,
+  }) async {
+    final baseUrl = await _baseUrl();
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/v1/auth/forgot-password'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'tenant_slug': kTenantSlug,
+          'email': email,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        return SyncResult(success: false, message: 'Unexpected server response.');
+      }
+      // Dev/demo: token is returned directly. Production: sent via email.
+      final token = decoded['reset_token'] as String?;
+      return SyncResult(
+        success: true,
+        message: decoded['message'] as String? ?? 'Reset token generated.',
+        data: token != null ? {'reset_token': token} : null,
+      );
+    } on TimeoutException {
+      return SyncResult(success: false, message: 'Connection timed out. Please try again.');
+    } catch (e) {
+      debugPrint('[HealthService.requestPasswordReset] $e');
+      return SyncResult(success: false, message: 'Unable to connect. Please check your internet connection.');
+    }
+  }
+
+  /// Reset the password using a valid [token].
+  static Future<SyncResult> resetPassword({
+    required String token,
+    required String newPassword,
+  }) async {
+    final baseUrl = await _baseUrl();
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/v1/auth/reset-password'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'token': token,
+          'new_password': newPassword,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final decoded = jsonDecode(response.body);
+        return SyncResult(
+          success: true,
+          message: (decoded is Map<String, dynamic>)
+              ? (decoded['message'] as String? ?? 'Password reset successfully.')
+              : 'Password reset successfully.',
+        );
+      } else {
+        String? detail;
+        try {
+          final decoded = jsonDecode(response.body);
+          if (decoded is Map<String, dynamic>) detail = decoded['detail'] as String?;
+        } catch (_) {}
+        return SyncResult(success: false, message: detail ?? 'Reset failed. Token may be expired.');
+      }
+    } on TimeoutException {
+      return SyncResult(success: false, message: 'Connection timed out. Please try again.');
+    } catch (e) {
+      debugPrint('[HealthService.resetPassword] $e');
       return SyncResult(success: false, message: 'Unable to connect. Please check your internet connection.');
     }
   }
@@ -449,6 +524,149 @@ class HealthService {
     }
   }
 
+  // ── Device brand detection ─────────────────────────────────────────────────
+  static const _keyDetectedBrand = 'detected_device_brand';
+  static const _keyDetectedSources = 'detected_source_names';
+
+  /// Bundle-ID prefix → brand mapping (mirrors backend device_resolver.py).
+  static const _bundleBrandMap = <String, String>{
+    'com.apple.health': 'Apple',
+    'com.garmin.connect': 'Garmin',
+    'com.fitbit': 'Fitbit',
+    'com.ouraring': 'Oura',
+    'com.polar': 'Polar',
+    'com.samsung.health': 'Samsung',
+    'com.huawei.health': 'Huawei',
+    'com.xiaomi': 'Xiaomi',
+    'com.withings': 'Withings',
+    'com.whoop': 'Whoop',
+  };
+
+  /// Keyword fallback when sourceId is unhelpful.
+  static const _keywordBrandMap = <String, String>{
+    'apple watch': 'Apple',
+    'garmin': 'Garmin',
+    'connect': 'Garmin',
+    'fitbit': 'Fitbit',
+    'oura': 'Oura',
+    'polar': 'Polar',
+    'samsung': 'Samsung',
+    'huawei': 'Huawei',
+    'whoop': 'Whoop',
+    'withings': 'Withings',
+  };
+
+  /// Detects the primary wearable brand by reading recent HR data sources
+  /// from HealthKit. Caches result in SharedPreferences.
+  /// Returns the brand name ("Apple", "Garmin", etc.) or null if unknown.
+  static Future<String?> detectDeviceBrand({bool forceRefresh = false}) async {
+    if (!forceRefresh) {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(_keyDetectedBrand);
+      if (cached != null) return cached.isEmpty ? null : cached;
+    }
+
+    try {
+      await ensureHealthConfigured();
+      final now = DateTime.now();
+      final data = await Health().getHealthDataFromTypes(
+        types: const [HealthDataType.HEART_RATE],
+        startTime: now.subtract(const Duration(days: 7)),
+        endTime: now,
+      );
+
+      // Collect unique sourceId + sourceName pairs
+      final brands = <String>{};
+      for (final p in data) {
+        // Try bundle ID first
+        final id = p.sourceId.toLowerCase();
+        for (final entry in _bundleBrandMap.entries) {
+          if (id.startsWith(entry.key)) {
+            brands.add(entry.value);
+            break;
+          }
+        }
+        // Keyword fallback on sourceName
+        if (brands.isEmpty) {
+          final name = p.sourceName.toLowerCase();
+          for (final entry in _keywordBrandMap.entries) {
+            if (name.contains(entry.key)) {
+              brands.add(entry.value);
+              break;
+            }
+          }
+        }
+      }
+
+      // Pick the wearable brand (prefer non-Apple if both exist,
+      // because iPhone also writes HR data passively).
+      String? primary;
+      if (brands.length == 1) {
+        primary = brands.first;
+      } else if (brands.length > 1) {
+        // If we see both Apple and a 3rd-party, the 3rd-party is the wearable
+        final nonApple = brands.where((b) => b != 'Apple').toList();
+        primary = nonApple.isNotEmpty ? nonApple.first : brands.first;
+      }
+
+      // Cache result
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_keyDetectedBrand, primary ?? '');
+      await prefs.setStringList(
+        _keyDetectedSources,
+        data.map((p) => p.sourceName).toSet().toList(),
+      );
+
+      return primary;
+    } catch (e) {
+      debugPrint('[HealthService.detectDeviceBrand] $e');
+      return null;
+    }
+  }
+
+  /// Returns the cached brand without re-querying HealthKit.
+  static Future<String?> getCachedDeviceBrand() async {
+    final prefs = await SharedPreferences.getInstance();
+    final cached = prefs.getString(_keyDetectedBrand);
+    return (cached == null || cached.isEmpty) ? null : cached;
+  }
+
+  /// Returns device-specific hint for a metric that shows "—".
+  /// If brand is known, gives actionable advice; otherwise generic.
+  static String metricHint(String metric, String? brand) {
+    switch (metric) {
+      case 'hrv':
+        if (brand == 'Garmin') return 'Garmin does not sync HRV to Apple Health';
+        if (brand == 'Fitbit') return 'Fitbit does not sync HRV to Apple Health';
+        return 'Requires a wearable that writes HRV to Health';
+      case 'hr':
+        if (brand == 'Garmin') return 'Check Garmin Connect → Health sync';
+        if (brand != null) return 'Check $brand → Health sync';
+        return 'Requires a wearable syncing to Health';
+      case 'rhr':
+        if (brand == 'Garmin') return 'Check Garmin Connect → Health sync';
+        return 'Requires a wearable syncing to Health';
+      case 'spo2':
+        if (brand == 'Garmin') return 'Check if your Garmin model supports SpO₂ → Health';
+        return 'Requires a device with SpO₂ sensor';
+      case 'resp':
+        if (brand == 'Garmin') return 'Garmin does not sync Resp Rate to Health';
+        return 'Requires Apple Watch Series 6+';
+      case 'exercise':
+        if (brand == 'Garmin') return 'Check Garmin Connect → Health sync';
+        return 'Start a workout on your wearable';
+      case 'sleep':
+        if (brand == 'Garmin') return 'Enable sleep tracking in Garmin Connect → Health';
+        return 'Enable sleep tracking on your wearable';
+      case 'bp':
+        return 'Requires a BP monitor app syncing to Health';
+      case 'afib':
+        return 'Requires Apple Watch with AFib detection';
+      default:
+        return 'Requires a compatible wearable';
+    }
+  }
+
   static Future<SyncResult> syncViaOW({
     void Function(String)? onLog,
   }) async {
@@ -474,6 +692,26 @@ class HealthService {
       // For sleep: look back from midnight last night (18:00 yesterday → now)
       final sleepStart = startOfDay.subtract(const Duration(hours: 6));
 
+      // Extended lookback windows for metrics that are NOT generated continuously
+      // during the day. Using startOfDay for these would miss data that was
+      // measured before midnight (e.g. overnight HRV) or not yet written today
+      // (e.g. RHR, which Apple Watch computes and writes once per day, often in
+      // the afternoon). We show the most recent value in the window.
+      //
+      // HRV (36h): covers the full previous sleep period even for early sleepers
+      //            (e.g. 10pm–6am sleep → readings from yesterday 10pm are included).
+      // RHR (48h): guarantees yesterday's value is always available even if today's
+      //            hasn't been written yet (Watch needs daytime samples to compute it).
+      // SpO2 / Resp Rate (24h): low-frequency spot measurements; 24h ensures at
+      //            least the most recent overnight background reading is visible.
+      // HRV: today midnight → now, matching Apple Health's daily AVERAGE window.
+      // Apple Watch records HRV during sleep starting at 12 AM local time,
+      // so midnight is the correct boundary (verified against Apple Health chart).
+      final hrvStart  = DateTime(now.year, now.month, now.day);
+      final rhrStart  = now.subtract(const Duration(hours: 48));
+      final spo2Start = now.subtract(const Duration(hours: 24));
+      final respStart = now.subtract(const Duration(hours: 24));
+
       // Fetch HR + HRV + Steps for today.
       // iOS uses SDNN; Android Health Connect only supports RMSSD.
       final hrvType = Platform.isIOS
@@ -486,63 +724,90 @@ class HealthService {
                    HealthDataType.SLEEP_DEEP, HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT]
           : const [HealthDataType.SLEEP_SESSION, HealthDataType.SLEEP_DEEP,
                    HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT];
+      // Steps use HKStatisticsQuery (same as Apple Health) — correctly deduplicates
+      // across sources (Apple Watch + iPhone). Start this in parallel with the
+      // HealthKit sample queries so all three requests are in-flight together.
+      final stepsFuture = Health()
+          .getTotalStepsInInterval(startOfDay, now)
+          .catchError((_) => null as int?);
+
       final results = await Future.wait([
-        Health().getHealthDataFromTypes(
-          types: [HealthDataType.HEART_RATE, hrvType, HealthDataType.STEPS],
-          startTime: startOfDay,
-          endTime: now,
-        ).catchError((_) => <HealthDataPoint>[]),
+        // HR: today only (continuous recording — startOfDay is correct).
+        // HRV: 36h lookback so overnight readings before midnight are included.
+        Future.wait([
+          Health().getHealthDataFromTypes(
+            types: [HealthDataType.HEART_RATE],
+            startTime: startOfDay,
+            endTime: now,
+          ).catchError((_) => <HealthDataPoint>[]),
+          Health().getHealthDataFromTypes(
+            types: [hrvType],
+            startTime: hrvStart,
+            endTime: now,
+          ).catchError((_) => <HealthDataPoint>[]),
+        ]).then((r) => [...r[0], ...r[1]]),
         Health().getHealthDataFromTypes(
           types: sleepTypes,
           startTime: sleepStart,
           endTime: now,
         ).catchError((_) => <HealthDataPoint>[]),
+        // RHR: 48h lookback — Watch writes one value per day, often in the afternoon;
+        //      without this, the value is missing all morning.
+        // SpO2: 24h lookback — low-frequency spot measurement.
+        // Exercise Time: today only (today's workout minutes).
+        Future.wait([
+          Health().getHealthDataFromTypes(
+            types: [HealthDataType.RESTING_HEART_RATE],
+            startTime: rhrStart,
+            endTime: now,
+          ).catchError((_) => <HealthDataPoint>[]),
+          Health().getHealthDataFromTypes(
+            types: [HealthDataType.BLOOD_OXYGEN],
+            startTime: spo2Start,
+            endTime: now,
+          ).catchError((_) => <HealthDataPoint>[]),
+          Health().getHealthDataFromTypes(
+            types: [HealthDataType.EXERCISE_TIME],
+            startTime: startOfDay,
+            endTime: now,
+          ).catchError((_) => <HealthDataPoint>[]),
+        ]).then((r) => [...r[0], ...r[1], ...r[2]]),
+        // Resp Rate: 24h lookback — measured during sleep (Watch S6+ only).
+        Health().getHealthDataFromTypes(
+          types: const [HealthDataType.RESPIRATORY_RATE],
+          startTime: respStart,
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
+        // BP + AFib: BP requires a 3rd-party cuff app writing to HealthKit.
+        // AFib burden requires iOS 16+ and Apple Watch (any series).
+        Health().getHealthDataFromTypes(
+          types: const [
+            HealthDataType.BLOOD_PRESSURE_SYSTOLIC,
+            HealthDataType.BLOOD_PRESSURE_DIASTOLIC,
+            HealthDataType.ATRIAL_FIBRILLATION_BURDEN,
+          ],
+          startTime: startOfDay,
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
       ]);
+      final totalSteps = await stepsFuture;
+
       final dedupedDay = Health().removeDuplicates(results[0]);
       final dedupedSleep = Health().removeDuplicates(results[1]);
+      final dedupedExtra = Health().removeDuplicates(results[2]);
+      final dedupedResp = Health().removeDuplicates(results[3]);
+      final dedupedOptional = Health().removeDuplicates(results[4]);
 
-      // Compute HR average
-      final hrValues = dedupedDay
-          .where((p) => p.type == HealthDataType.HEART_RATE && p.value is NumericHealthValue)
-          .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
-          .toList();
-      final avgHr = hrValues.isEmpty
-          ? null
-          : hrValues.reduce((a, b) => a + b) / hrValues.length;
-
-      // Compute steps total
-      final stepValues = dedupedDay
-          .where((p) => p.type == HealthDataType.STEPS && p.value is NumericHealthValue)
-          .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
-          .toList();
-      final totalSteps =
-          stepValues.isEmpty ? null : stepValues.reduce((a, b) => a + b).toInt();
-
-      // Compute latest HRV (type is platform-dependent, captured above)
-      final hrvPoints = dedupedDay
-          .where((p) => p.type == hrvType && p.value is NumericHealthValue)
-          .toList()
-        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
-      final latestHrv = hrvPoints.isEmpty
-          ? null
-          : (hrvPoints.first.value as NumericHealthValue).numericValue.toDouble();
-
-      // Compute sleep hours
-      double sleepSec = 0;
-      for (final p in dedupedSleep) {
-        sleepSec += p.dateTo.difference(p.dateFrom).inSeconds;
-      }
-      final sleepHours = dedupedSleep.isEmpty ? null : sleepSec / 3600.0;
-
-      // Determine the primary data source from today's HR readings.
-      // The most frequent source wins (e.g. "Apple Watch" vs "Garmin Connect").
-      final hrPoints = dedupedDay
+      // Determine primary HR source first (most readings wins — Apple Watch
+      // records continuously so it dominates over sporadic iPhone readings).
+      // This must happen before computing avgHr so we can filter by source.
+      final allHrPoints = dedupedDay
           .where((p) => p.type == HealthDataType.HEART_RATE)
           .toList();
       String? primarySource;
-      if (hrPoints.isNotEmpty) {
+      if (allHrPoints.isNotEmpty) {
         final sourceCounts = <String, int>{};
-        for (final p in hrPoints) {
+        for (final p in allHrPoints) {
           sourceCounts[p.sourceName] = (sourceCounts[p.sourceName] ?? 0) + 1;
         }
         primarySource = sourceCounts.entries
@@ -550,21 +815,350 @@ class HealthService {
             .key;
       }
 
+      // Compute HR average from primary source only.
+      // Filtering by source prevents cross-device averaging where iPhone and
+      // Apple Watch both contribute readings at different (non-duplicate) times.
+      final hrValues = dedupedDay
+          .where((p) =>
+              p.type == HealthDataType.HEART_RATE &&
+              p.value is NumericHealthValue &&
+              (primarySource == null || p.sourceName == primarySource))
+          .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
+          .toList();
+      final avgHr = hrValues.isEmpty
+          ? null
+          : hrValues.reduce((a, b) => a + b) / hrValues.length;
+
+      // HRV: average of all readings in the 36h window — matches Apple Health's
+      // HRV: arithmetic mean of all SDNN readings since midnight, matching
+      // Apple Health's daily AVERAGE display exactly.
+      final hrvValues = dedupedDay
+          .where((p) => p.type == hrvType && p.value is NumericHealthValue)
+          .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
+          .toList();
+      final latestHrv = hrvValues.isEmpty
+          ? null
+          : hrvValues.reduce((a, b) => a + b) / hrvValues.length;
+
+      // Compute sleep hours.
+      // Priority: sum DEEP + REM + LIGHT stages (most accurate, no overlap).
+      // Fallback: SLEEP_ASLEEP if no stage data (older devices / iPhone-only).
+      // SLEEP_IN_BED is never used for the total — it spans the full in-bed
+      // period (including awake time) and overlaps with every other type.
+      const stageTypes = {
+        HealthDataType.SLEEP_DEEP,
+        HealthDataType.SLEEP_REM,
+        HealthDataType.SLEEP_LIGHT,
+      };
+      final stagePoints = dedupedSleep.where((p) => stageTypes.contains(p.type)).toList();
+      final asleepPoints = dedupedSleep.where((p) => p.type == HealthDataType.SLEEP_ASLEEP).toList();
+      final sleepPoints = stagePoints.isNotEmpty ? stagePoints : asleepPoints;
+      double sleepSec = 0;
+      for (final p in sleepPoints) {
+        sleepSec += p.dateTo.difference(p.dateFrom).inSeconds;
+      }
+      final sleepHours = sleepPoints.isEmpty ? null : sleepSec / 3600.0;
+
+      // SpO2: latest Blood Oxygen reading (spot measurement, Watch S6+).
+      final spo2Points = dedupedExtra
+          .where((p) => p.type == HealthDataType.BLOOD_OXYGEN && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      // HealthKit stores BLOOD_OXYGEN as a ratio (0.0–1.0); multiply by 100
+      // to convert to percentage (e.g. 0.97 → 97.0%).
+      final latestSpo2 = spo2Points.isEmpty
+          ? null
+          : (spo2Points.first.value as NumericHealthValue).numericValue.toDouble() * 100;
+
+      // RHR: Apple Watch writes one resting HR reading per day.
+      final rhrPoints = dedupedExtra
+          .where((p) => p.type == HealthDataType.RESTING_HEART_RATE && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      final latestRhr = rhrPoints.isEmpty
+          ? null
+          : (rhrPoints.first.value as NumericHealthValue).numericValue.toDouble();
+
+      // Exercise Time: sum all intervals recorded today.
+      final exerciseSec = dedupedExtra
+          .where((p) => p.type == HealthDataType.EXERCISE_TIME && p.value is NumericHealthValue)
+          .fold<double>(0, (acc, p) =>
+              acc + (p.value as NumericHealthValue).numericValue.toDouble() * 60);
+      final exerciseMin = exerciseSec == 0 ? null : (exerciseSec / 60).round();
+
+      // Resp Rate: latest reading (Watch S6+ only — null on unsupported devices).
+      final respPoints = dedupedResp
+          .where((p) => p.type == HealthDataType.RESPIRATORY_RATE && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      final latestRespRate = respPoints.isEmpty
+          ? null
+          : (respPoints.first.value as NumericHealthValue).numericValue.toDouble();
+
+      // Blood Pressure: latest systolic/diastolic readings (3rd-party cuff app required).
+      final bpSysPoints = dedupedOptional
+          .where((p) => p.type == HealthDataType.BLOOD_PRESSURE_SYSTOLIC && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      final latestBpSys = bpSysPoints.isEmpty
+          ? null
+          : (bpSysPoints.first.value as NumericHealthValue).numericValue.toDouble();
+
+      final bpDiaPoints = dedupedOptional
+          .where((p) => p.type == HealthDataType.BLOOD_PRESSURE_DIASTOLIC && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      final latestBpDia = bpDiaPoints.isEmpty
+          ? null
+          : (bpDiaPoints.first.value as NumericHealthValue).numericValue.toDouble();
+
+      // AFib: ATRIAL_FIBRILLATION_BURDEN is a percentage (0–100).
+      // Convert to bool: any burden > 0 means AFib was detected today.
+      final afibPoints = dedupedOptional
+          .where((p) => p.type == HealthDataType.ATRIAL_FIBRILLATION_BURDEN && p.value is NumericHealthValue)
+          .toList()
+        ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+      final bool? afibDetected = afibPoints.isEmpty
+          ? null
+          : (afibPoints.first.value as NumericHealthValue).numericValue > 0;
+
       return HealthSnapshot(
         avgHr: avgHr != null ? double.parse(avgHr.toStringAsFixed(0)) : null,
         steps: totalSteps,
-        sleepHours: sleepHours != null
-            ? double.parse(sleepHours.toStringAsFixed(1))
-            : null,
-        hrv: latestHrv != null
-            ? double.parse(latestHrv.toStringAsFixed(0))
-            : null,
+        sleepHours: sleepHours != null ? double.parse(sleepHours.toStringAsFixed(1)) : null,
+        hrv: latestHrv != null ? double.parse(latestHrv.toStringAsFixed(0)) : null,
+        spo2: latestSpo2 != null ? double.parse(latestSpo2.toStringAsFixed(1)) : null,
+        rhr: latestRhr != null ? double.parse(latestRhr.toStringAsFixed(0)) : null,
+        exerciseMin: exerciseMin,
+        respRate: latestRespRate != null ? double.parse(latestRespRate.toStringAsFixed(1)) : null,
+        bpSystolic: latestBpSys != null ? double.parse(latestBpSys.toStringAsFixed(0)) : null,
+        bpDiastolic: latestBpDia != null ? double.parse(latestBpDia.toStringAsFixed(0)) : null,
+        afibDetected: afibDetected,
         fetchedAt: now,
         primarySource: primarySource,
       );
     } catch (e) {
       debugPrint('[HealthService.fetchTodaySnapshot] $e');
       return HealthSnapshot(fetchedAt: DateTime.now());
+    }
+  }
+
+  // ── Local HealthKit metric history (offline, multi-day) ─────────────────
+  /// Fetches daily metric aggregates for the past [days] days from HealthKit.
+  /// Uses local HealthKit data (no network) for fast chart rendering.
+  static Future<List<DailyMetricPoint>> fetchMetricHistory({required int days}) async {
+    try {
+      await ensureHealthConfigured();
+      final now = DateTime.now();
+      final startTime = DateTime(now.year, now.month, now.day)
+          .subtract(Duration(days: days - 1));
+
+      final hrvType = Platform.isIOS
+          ? HealthDataType.HEART_RATE_VARIABILITY_SDNN
+          : HealthDataType.HEART_RATE_VARIABILITY_RMSSD;
+
+      final sleepTypes = Platform.isIOS
+          ? [HealthDataType.SLEEP_DEEP, HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT,
+             HealthDataType.SLEEP_ASLEEP]
+          : [HealthDataType.SLEEP_DEEP, HealthDataType.SLEEP_REM, HealthDataType.SLEEP_LIGHT,
+             HealthDataType.SLEEP_SESSION];
+
+      final results = await Future.wait([
+        Health().getHealthDataFromTypes(
+          types: [HealthDataType.HEART_RATE, hrvType],
+          startTime: startTime,
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
+        Health().getHealthDataFromTypes(
+          types: [HealthDataType.STEPS],
+          startTime: startTime,
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
+        Health().getHealthDataFromTypes(
+          types: sleepTypes,
+          startTime: startTime.subtract(const Duration(hours: 6)),
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
+        // Extra metrics: RHR, SpO2, Exercise Time, Resp Rate, AFib burden.
+        Health().getHealthDataFromTypes(
+          types: [
+            HealthDataType.RESTING_HEART_RATE,
+            HealthDataType.BLOOD_OXYGEN,
+            HealthDataType.EXERCISE_TIME,
+            HealthDataType.RESPIRATORY_RATE,
+            HealthDataType.ATRIAL_FIBRILLATION_BURDEN,
+          ],
+          startTime: startTime,
+          endTime: now,
+        ).catchError((_) => <HealthDataPoint>[]),
+      ]);
+
+      final allHrHrv = Health().removeDuplicates(results[0]);
+      final allSteps = Health().removeDuplicates(results[1]);
+      final allSleep = Health().removeDuplicates(results[2]);
+      final allExtra = Health().removeDuplicates(results[3]);
+
+      // Determine primary HR source (most readings) to avoid cross-device mixing
+      final hrSourceCounts = <String, int>{};
+      for (final p in allHrHrv.where((p) => p.type == HealthDataType.HEART_RATE)) {
+        hrSourceCounts[p.sourceName] = (hrSourceCounts[p.sourceName] ?? 0) + 1;
+      }
+      final primaryHrSource = hrSourceCounts.isEmpty
+          ? null
+          : hrSourceCounts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+
+      // Determine primary Steps source
+      final stepSourceCounts = <String, int>{};
+      for (final p in allSteps) {
+        stepSourceCounts[p.sourceName] = (stepSourceCounts[p.sourceName] ?? 0) + 1;
+      }
+      final primaryStepSource = stepSourceCounts.isEmpty
+          ? null
+          : stepSourceCounts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+
+      // Build one DailyMetricPoint per calendar day
+      final points = <DailyMetricPoint>[];
+      for (int i = 0; i < days; i++) {
+        final dayStart = DateTime(startTime.year, startTime.month, startTime.day)
+            .add(Duration(days: i));
+        final dayEnd = dayStart.add(const Duration(days: 1));
+
+        // HR average for this day (primary source only)
+        final hrVals = allHrHrv
+            .where((p) =>
+                p.type == HealthDataType.HEART_RATE &&
+                p.value is NumericHealthValue &&
+                (primaryHrSource == null || p.sourceName == primaryHrSource) &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
+            .toList();
+        final avgHr = hrVals.isEmpty
+            ? null
+            : hrVals.reduce((a, b) => a + b) / hrVals.length;
+
+        // HRV: latest reading for the day
+        final hrvPoints = allHrHrv
+            .where((p) =>
+                p.type == hrvType &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .toList()
+          ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+        final latestHrv = hrvPoints.isEmpty
+            ? null
+            : (hrvPoints.first.value as NumericHealthValue).numericValue.toDouble();
+
+        // Steps: sum from primary source only for this day
+        final stepVals = allSteps
+            .where((p) =>
+                p.value is NumericHealthValue &&
+                (primaryStepSource == null || p.sourceName == primaryStepSource) &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .map((p) => (p.value as NumericHealthValue).numericValue.toDouble())
+            .toList();
+        final totalSteps = stepVals.isEmpty
+            ? null
+            : stepVals.reduce((a, b) => a + b).toInt();
+
+        // Sleep: sum DEEP+REM+LIGHT stages for the night covering this day
+        // Sleep night = previous day 18:00 → this day 14:00
+        final sleepNightStart = dayStart.subtract(const Duration(hours: 6));
+        const stageTypes = {
+          HealthDataType.SLEEP_DEEP,
+          HealthDataType.SLEEP_REM,
+          HealthDataType.SLEEP_LIGHT,
+        };
+        final stagePts = allSleep.where((p) =>
+            stageTypes.contains(p.type) &&
+            !p.dateFrom.isBefore(sleepNightStart) &&
+            p.dateFrom.isBefore(dayEnd)).toList();
+        final asleepPts = allSleep.where((p) =>
+            p.type == HealthDataType.SLEEP_ASLEEP &&
+            !p.dateFrom.isBefore(sleepNightStart) &&
+            p.dateFrom.isBefore(dayEnd)).toList();
+        final sleepPts = stagePts.isNotEmpty ? stagePts : asleepPts;
+        double sleepSec = 0;
+        for (final p in sleepPts) {
+          sleepSec += p.dateTo.difference(p.dateFrom).inSeconds;
+        }
+        final sleepHours = sleepPts.isEmpty ? null : sleepSec / 3600.0;
+
+        // RHR: Apple Watch writes one value per day.
+        final rhrPts = allExtra
+            .where((p) =>
+                p.type == HealthDataType.RESTING_HEART_RATE &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .toList()
+          ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+        final dayRhr = rhrPts.isEmpty
+            ? null
+            : (rhrPts.first.value as NumericHealthValue).numericValue.toDouble();
+
+        // SpO2: latest reading of the day.
+        final spo2Pts = allExtra
+            .where((p) =>
+                p.type == HealthDataType.BLOOD_OXYGEN &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .toList()
+          ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+        // HealthKit stores BLOOD_OXYGEN as a ratio (0.0–1.0); multiply by 100.
+        final daySpo2 = spo2Pts.isEmpty
+            ? null
+            : (spo2Pts.first.value as NumericHealthValue).numericValue.toDouble() * 100;
+
+        // Exercise Time: sum all intervals for the day.
+        final exerciseSec = allExtra
+            .where((p) =>
+                p.type == HealthDataType.EXERCISE_TIME &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .fold<double>(0, (acc, p) =>
+                acc + (p.value as NumericHealthValue).numericValue.toDouble() * 60);
+        final dayExerciseMin = exerciseSec == 0 ? null : (exerciseSec / 60).round();
+
+        // Resp Rate: latest reading of the day.
+        final respPts = allExtra
+            .where((p) =>
+                p.type == HealthDataType.RESPIRATORY_RATE &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .toList()
+          ..sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
+        final dayRespRate = respPts.isEmpty
+            ? null
+            : (respPts.first.value as NumericHealthValue).numericValue.toDouble();
+
+        // AFib: any burden > 0 means AFib detected that day.
+        final afibPts = allExtra
+            .where((p) =>
+                p.type == HealthDataType.ATRIAL_FIBRILLATION_BURDEN &&
+                p.value is NumericHealthValue &&
+                !p.dateFrom.isBefore(dayStart) && p.dateFrom.isBefore(dayEnd))
+            .toList();
+        final bool? dayAfib = afibPts.isEmpty
+            ? null
+            : afibPts.any((p) =>
+                (p.value as NumericHealthValue).numericValue > 0);
+
+        points.add(DailyMetricPoint(
+          date: dayStart,
+          avgHr: avgHr != null ? double.parse(avgHr.toStringAsFixed(1)) : null,
+          hrv: latestHrv != null ? double.parse(latestHrv.toStringAsFixed(1)) : null,
+          steps: totalSteps,
+          sleepHours: sleepHours != null ? double.parse(sleepHours.toStringAsFixed(1)) : null,
+          rhr: dayRhr != null ? double.parse(dayRhr.toStringAsFixed(1)) : null,
+          spo2: daySpo2 != null ? double.parse(daySpo2.toStringAsFixed(1)) : null,
+          exerciseMin: dayExerciseMin,
+          respRate: dayRespRate != null ? double.parse(dayRespRate.toStringAsFixed(1)) : null,
+          afibDetected: dayAfib,
+        ));
+      }
+      return points;
+    } catch (e) {
+      debugPrint('[HealthService.fetchMetricHistory] $e');
+      return [];
     }
   }
 
@@ -585,7 +1179,7 @@ class HealthService {
       final response = await http.get(
         Uri.parse('$lpUrl/api/v1/reports/summary/$lpUserId'),
         headers: {'Authorization': 'Bearer $token'},
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 401) {
         sessionExpired.value = true;
@@ -620,6 +1214,9 @@ class HealthService {
         latestAnomalies: latestAnomalies,
         fraudRiskScore: fraudScore,
         fetchedAt: DateTime.now(),
+        baselineMaturity: body['baseline_maturity'] as String? ?? 'cold_start',
+        daysWithData: (body['days_with_data'] as num? ?? 0).toInt(),
+        estimatedEstablishedDate: body['estimated_established_date'] as String?,
       );
 
       // Cache for offline use
@@ -678,6 +1275,9 @@ class HealthService {
         // Always null here — do NOT read it from the unencrypted cache.
         fraudRiskScore: null,
         fetchedAt: DateTime.tryParse(body['_cached_at'] as String? ?? '') ?? DateTime.now(),
+        baselineMaturity: body['baseline_maturity'] as String? ?? 'cold_start',
+        daysWithData: (body['days_with_data'] as num? ?? 0).toInt(),
+        estimatedEstablishedDate: body['estimated_established_date'] as String?,
       );
     } catch (_) {
       return null;
@@ -691,12 +1291,17 @@ class HealthService {
   static Future<SyncResult> syncDirect({
     void Function(String)? onLog,
     int? maxDays,
+    bool forceFullResync = false,
   }) {
     if (_ongoingSync != null) {
       onLog?.call('ℹ️  Sync already running — waiting for it to complete…');
       return _ongoingSync!;
     }
-    _ongoingSync = _doSyncDirect(onLog: onLog, maxDays: maxDays).whenComplete(() {
+    _ongoingSync = _doSyncDirect(
+      onLog: onLog,
+      maxDays: maxDays,
+      forceFullResync: forceFullResync,
+    ).whenComplete(() {
       _ongoingSync = null;
     });
     return _ongoingSync!;
@@ -710,6 +1315,8 @@ class HealthService {
   /// Sleep data uses a separate window (yesterday 18:00 → now) because sleep spans
   /// midnight and needs to be fetched relative to the prior evening.
   static const _keySyncInProgress = 'sync_in_progress_at';
+  static const _keyHistoricalSyncCursor = 'historical_sync_cursor';
+  static const _historicalSyncDays = 365;
 
   /// Returns true if a sync completed or started within the last [minutes].
   /// Used by the background isolate to avoid duplicate syncs (static fields
@@ -726,6 +1333,7 @@ class HealthService {
   static Future<SyncResult> _doSyncDirect({
     void Function(String)? onLog,
     int? maxDays,
+    bool forceFullResync = false,
   }) async {
     // Ensure health plugin is configured before any HealthKit/HC call.
     await ensureHealthConfigured();
@@ -748,6 +1356,12 @@ class HealthService {
       return SyncResult(success: false, message: 'Not logged in. Please sign in first.');
     }
 
+    if (forceFullResync) {
+      return _runChunkedHistoricalSync(
+        prefs: prefs, lpUrl: lpUrl, token: token, onLog: onLog,
+      );
+    }
+
     try {
       if (Platform.isAndroid) {
         final status = await Health().getHealthConnectSdkStatus();
@@ -763,6 +1377,7 @@ class HealthService {
       // ── Step 1: Determine sync start time via server anchor ───────────────
       final endTime = DateTime.now();
       DateTime startTime;
+
       try {
         final anchorResp = await http.get(
           Uri.parse('$lpUrl/api/v1/data/latest-event-time'),
@@ -1018,7 +1633,7 @@ class HealthService {
     try {
       final response = await http
           .get(Uri.parse('$lpUrl/api/v1/health'))
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 15));
       if (response.statusCode == 200) {
         final body = jsonDecode(response.body);
         return SyncResult(
@@ -1035,6 +1650,177 @@ class HealthService {
     }
   }
 
+  // ── Chunked historical sync ───────────────────────────────────────────────
+  /// Fetches and uploads the last [_historicalSyncDays] days from HealthKit
+  /// in 7-day chunks. A cursor in SharedPreferences allows resuming after
+  /// interruption — each successful chunk advances the cursor, so failed
+  /// chunks are retried on the next call rather than re-doing everything.
+  static Future<SyncResult> _runChunkedHistoricalSync({
+    required SharedPreferences prefs,
+    required String lpUrl,
+    required String token,
+    void Function(String)? onLog,
+  }) async {
+    final coreTypes = _platformSyncTypes();
+    final allTypes = [...coreTypes, ..._optionalSyncTypes];
+
+    onLog?.call('Requesting HealthKit permissions…');
+    final granted = await Health().requestAuthorization(allTypes);
+    if (!granted) {
+      return SyncResult(
+        success: false,
+        message: 'Apple Health access is required to re-sync historical data.',
+        errorType: SyncErrorType.permissionDenied,
+      );
+    }
+
+    final now = DateTime.now();
+    final fullStart = now.subtract(const Duration(days: _historicalSyncDays));
+    final cursorStr = prefs.getString(_keyHistoricalSyncCursor);
+    DateTime chunkStart = (cursorStr != null ? DateTime.tryParse(cursorStr) : null) ?? fullStart;
+
+    final totalChunks = (_historicalSyncDays / 7).ceil();
+    int chunkIdx = totalChunks - (now.difference(chunkStart).inDays / 7).ceil();
+
+    int totalSent = 0;
+    var currentToken = token;
+    DateTime lastTokenRefresh = DateTime.now();
+
+    while (chunkStart.isBefore(now)) {
+      final chunkEnd = chunkStart.add(const Duration(days: 7));
+      final effectiveEnd = chunkEnd.isBefore(now) ? chunkEnd : now;
+      chunkIdx++;
+
+      final label = 'Week $chunkIdx of $totalChunks';
+      onLog?.call('Historical sync: $label…');
+      historicalSyncProgress.value = label;
+
+      // Refresh token every 10 minutes during long uploads
+      if (DateTime.now().difference(lastTokenRefresh).inMinutes >= 10) {
+        await refreshTokenIfNeeded();
+        currentToken = (await _secureStorage.read(key: _keyJwtToken)) ?? currentToken;
+        lastTokenRefresh = DateTime.now();
+      }
+
+      try {
+        final fetchResults = await Future.wait([
+          Health().getHealthDataFromTypes(
+            types: coreTypes,
+            startTime: chunkStart,
+            endTime: effectiveEnd,
+          ).catchError((_) => <HealthDataPoint>[]),
+          Health().getHealthDataFromTypes(
+            types: _optionalSyncTypes,
+            startTime: chunkStart,
+            endTime: effectiveEnd,
+          ).catchError((_) => <HealthDataPoint>[]),
+        ]);
+
+        final allPoints = Health().removeDuplicates([...fetchResults[0], ...fetchResults[1]]);
+        final events = allPoints
+            .map(_convertToMobileSyncEvent)
+            .whereType<Map<String, dynamic>>()
+            .toList();
+
+        if (events.isNotEmpty) {
+          // Upload in batches of 2000
+          for (int i = 0; i < events.length; i += 2000) {
+            final batch = events.sublist(i, (i + 2000).clamp(0, events.length));
+            http.Response? response;
+            for (int attempt = 0; attempt < 3; attempt++) {
+              if (attempt > 0) await Future.delayed(Duration(seconds: attempt * 3));
+              try {
+                response = await http.post(
+                  Uri.parse('$lpUrl/api/v1/data/mobile-sync'),
+                  headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $currentToken'},
+                  body: jsonEncode({'events': batch}),
+                ).timeout(const Duration(seconds: 45));
+                if (response.statusCode != 429 && response.statusCode != 503) break;
+              } catch (_) { /* retry */ }
+            }
+            if (response == null || (response.statusCode != 200 && response.statusCode != 201)) {
+              // Chunk failed — keep cursor at chunkStart so next run retries this chunk
+              historicalSyncProgress.value = null;
+              return SyncResult(
+                success: false,
+                message: 'Upload failed at $label. Re-sync will resume from this point.',
+              );
+            }
+          }
+          totalSent += events.length;
+        }
+      } catch (_) {
+        historicalSyncProgress.value = null;
+        return SyncResult(success: false, message: 'Error at $label. Re-sync will resume from this point.');
+      }
+
+      // Chunk succeeded — advance cursor
+      await prefs.setString(_keyHistoricalSyncCursor, effectiveEnd.toIso8601String());
+      chunkStart = effectiveEnd;
+    }
+
+    // All chunks complete
+    await prefs.remove(_keyHistoricalSyncCursor);
+    historicalSyncProgress.value = null;
+    onLog?.call('Historical sync complete: $totalSent events uploaded.');
+    return SyncResult(
+      success: true,
+      message: 'Historical sync complete: $totalSent events uploaded.',
+      data: {'events_received': totalSent, 'source_devices': <String>[]},
+    );
+  }
+
+  // ── Local HealthKit coverage ───────────────────────────────────────────────
+  /// Counts how many distinct calendar days in the last [days] days have at
+  /// least one Heart Rate reading in HealthKit. Used by the Trends screen to
+  /// show "X analyzed · Y in Apple Health" and surface sync gaps.
+  static Future<int> fetchLocalDaysWithData({required int days}) async {
+    try {
+      final now = DateTime.now();
+      final start = DateTime(now.year, now.month, now.day)
+          .subtract(Duration(days: days - 1));
+      final results = await Health().getHealthDataFromTypes(
+        types: [HealthDataType.HEART_RATE],
+        startTime: start,
+        endTime: now,
+      );
+      return results
+          .map((p) => DateTime(p.dateFrom.year, p.dateFrom.month, p.dateFrom.day))
+          .toSet()
+          .length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  // ── Client error reporting ────────────────────────────────────────────────
+  /// Report a persistent client-side error to the backend audit log.
+  /// Fire-and-forget: failures are silently swallowed so this never blocks the UI.
+  static Future<void> reportClientError(
+    String errorCode, {
+    String? context,
+    int? retryCount,
+  }) async {
+    try {
+      final baseUrl = await _baseUrl();
+      final headers = await _authHeaders();
+      await http
+          .post(
+            Uri.parse('$baseUrl/api/v1/client-errors'),
+            headers: headers,
+            body: jsonEncode({
+              'error_code': errorCode,
+              if (context != null) 'context': context,
+              if (retryCount != null) 'retry_count': retryCount,
+              'platform': Platform.operatingSystem,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // Intentionally silent — error reporting must never crash the app.
+    }
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   static Map<String, dynamic>? _convertToMobileSyncEvent(HealthDataPoint dp) {
     final lpMetric = _healthTypeToLp(dp.type);
@@ -1047,6 +1833,14 @@ class HealthService {
       if (numericValue <= 0) return null;
     } else if (dp.value is NumericHealthValue) {
       numericValue = (dp.value as NumericHealthValue).numericValue.toDouble();
+      // HealthKit stores BLOOD_OXYGEN as a ratio (0.0–1.0); backend expects %.
+      if (lpMetric == 'SPO2_INSTANT') {
+        numericValue = numericValue * 100;
+      }
+      // AFib burden is a percentage (0–100); convert to binary flag for AFIB_FLAG.
+      if (lpMetric == 'AFIB_FLAG') {
+        numericValue = numericValue > 0 ? 1.0 : 0.0;
+      }
     } else {
       return null; // Unsupported value type
     }
@@ -1071,6 +1865,8 @@ class HealthService {
       'start_time': dp.dateFrom.toUtc().toIso8601String(),
       'end_time': dp.dateTo.toUtc().toIso8601String(),
       'source_device': dp.sourceName,
+      'source_app_id': dp.sourceId,
+      'device_model_raw': dp.deviceModel,
       'source_platform': Platform.isIOS ? 'HEALTHKIT' : 'HEALTH_CONNECT',
       if (algoMeta != null) 'algorithm_metadata': algoMeta,
     };
@@ -1098,19 +1894,16 @@ class HealthService {
       HealthDataType.HEART_RATE_VARIABILITY_RMSSD: 'HRV_RMSSD',  // Android
       HealthDataType.STEPS: 'STEPS_DELTA',
       HealthDataType.BLOOD_OXYGEN: 'SPO2_INSTANT',
-      HealthDataType.ACTIVE_ENERGY_BURNED: 'ENERGY_DELTA',
       HealthDataType.RESTING_HEART_RATE: 'RHR_DAILY',
-      // Extended metrics (added v2.6)
-      HealthDataType.DISTANCE_WALKING_RUNNING: 'DISTANCE_DELTA',
-      HealthDataType.FLIGHTS_CLIMBED: 'FLOORS_CLIMBED',
       HealthDataType.EXERCISE_TIME: 'EXERCISE_TIME',
-      HealthDataType.BASAL_ENERGY_BURNED: 'ENERGY_BASAL',
       // Optional (Apple Watch S6+ / v13 new types)
       HealthDataType.RESPIRATORY_RATE: 'RESP_RATE',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'BP_SYSTOLIC',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'BP_DIASTOLIC',
-      HealthDataType.WALKING_SPEED: 'WALKING_SPEED',
-      HealthDataType.APPLE_STAND_TIME: 'STAND_TIME',
+      // v3.2: AFib burden (iOS 16+, Apple Watch) → binary 0/1 flag
+      HealthDataType.ATRIAL_FIBRILLATION_BURDEN: 'AFIB_FLAG',
+      // v3.0 removed: ENERGY_DELTA, ENERGY_BASAL, DISTANCE_DELTA,
+      // FLOORS_CLIMBED, STAND_TIME, WALKING_SPEED (low actuarial value)
     };
     return map[type];
   }
@@ -1123,19 +1916,13 @@ class HealthService {
       HealthDataType.HEART_RATE_VARIABILITY_RMSSD: 'ms',
       HealthDataType.STEPS: 'count',
       HealthDataType.BLOOD_OXYGEN: '%',
-      HealthDataType.ACTIVE_ENERGY_BURNED: 'kcal',
       HealthDataType.RESTING_HEART_RATE: 'bpm',
-      // Extended metrics
-      HealthDataType.DISTANCE_WALKING_RUNNING: 'm',
-      HealthDataType.FLIGHTS_CLIMBED: 'count',
       HealthDataType.EXERCISE_TIME: 'min',
-      HealthDataType.BASAL_ENERGY_BURNED: 'kcal',
       // Optional
       HealthDataType.RESPIRATORY_RATE: 'breaths/min',
       HealthDataType.BLOOD_PRESSURE_SYSTOLIC: 'mmHg',
       HealthDataType.BLOOD_PRESSURE_DIASTOLIC: 'mmHg',
-      HealthDataType.WALKING_SPEED: 'm/s',
-      HealthDataType.APPLE_STAND_TIME: 'min',
+      HealthDataType.ATRIAL_FIBRILLATION_BURDEN: '%',
     };
     return map[type] ?? 'unknown';
   }
@@ -1191,9 +1978,8 @@ class HealthService {
       if (timeLeft.inMinutes > 10) return; // Still fresh, skip
     } catch (e) {
       // JWT decode failed — token may be corrupted/truncated in Keychain.
-      // Log for debugging; the next API call will return 401 and trigger sessionExpired.
-      debugPrint('[HealthService.refreshTokenIfNeeded] Token decode failed: $e');
-      return;
+      // Force a refresh attempt rather than waiting for a 401 at next API call.
+      debugPrint('[HealthService.refreshTokenIfNeeded] Token decode failed, forcing refresh: $e');
     }
 
     // Refresh via API

@@ -6,6 +6,7 @@ import 'screens/onboarding_screen.dart';
 import 'screens/main_tab_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
+import 'screens/forgot_password_screen.dart';
 import 'services/health_service.dart';
 
 const _bgSyncTask = 'lifepulse.periodicSync';
@@ -99,7 +100,9 @@ class TikCareLifePulseApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF1B3A6B),
           brightness: Brightness.light,
+          surface: const Color(0xFFF4F3F0),
         ),
+        scaffoldBackgroundColor: const Color(0xFFF4F3F0),
         useMaterial3: true,
         fontFamily: 'SF Pro Display',
       ),
@@ -109,6 +112,7 @@ class TikCareLifePulseApp extends StatelessWidget {
         '/onboarding': (ctx) => const OnboardingScreen(),
         '/login': (ctx) => const LoginScreen(),
         '/register': (ctx) => const RegisterScreen(),
+        '/forgot-password': (ctx) => const ForgotPasswordScreen(),
         '/home': (ctx) => MainTabScreen(prefs: prefs),
         // Legacy route: redirect to Profile tab
         '/config': (ctx) => MainTabScreen(prefs: prefs, initialTab: 4),

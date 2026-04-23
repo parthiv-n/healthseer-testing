@@ -1,7 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../services/health_service.dart';
-
-const _navy = Color(0xFF1B3A6B);
+import '../theme/colors.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -15,12 +15,15 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final _passwordCtrl = TextEditingController();
   final _confirmCtrl = TextEditingController();
   bool _loading = false;
+  bool _slowHint = false;
   String? _error;
   bool _obscure = true;
   bool _obscureConfirm = true;
+  Timer? _slowHintTimer;
 
   @override
   void dispose() {
+    _slowHintTimer?.cancel();
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     _confirmCtrl.dispose();
@@ -36,6 +39,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
       setState(() => _error = 'Please fill in all fields.');
       return;
     }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      setState(() => _error = 'Please enter a valid email address.');
+      return;
+    }
     if (password != confirm) {
       setState(() => _error = 'Passwords do not match.');
       return;
@@ -45,29 +52,45 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    setState(() { _loading = true; _error = null; });
+    setState(() { _loading = true; _error = null; _slowHint = false; });
+    _slowHintTimer?.cancel();
+    _slowHintTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted && _loading) setState(() => _slowHint = true);
+    });
 
-    final result = await HealthService.register(email: email, password: password);
+    try {
+      final result = await HealthService.register(email: email, password: password);
 
-    if (!mounted) return;
-    if (result.success) {
-      await HealthService.registerBackgroundSync();
+      _slowHintTimer?.cancel();
       if (!mounted) return;
-      Navigator.pushReplacementNamed(context, '/home');
-    } else {
-      setState(() { _loading = false; _error = result.message; });
+      if (result.success) {
+        try {
+          await HealthService.registerBackgroundSync();
+        } catch (_) {
+          // Background sync registration is best-effort; proceed to home regardless.
+        }
+        if (!mounted) return;
+        Navigator.pushReplacementNamed(context, '/home');
+      } else {
+        setState(() { _loading = false; _slowHint = false; _error = result.message; });
+      }
+    } catch (e) {
+      _slowHintTimer?.cancel();
+      if (mounted) {
+        setState(() { _loading = false; _slowHint = false; _error = 'An unexpected error occurred. Please try again.'; });
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF7F9FC),
+      backgroundColor: kBg,
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
-        foregroundColor: _navy,
-        title: const Text('Create Account', style: TextStyle(fontWeight: FontWeight.w600, color: _navy)),
+        foregroundColor: kNavy,
+        title: const Text('Create Account', style: TextStyle(fontWeight: FontWeight.w600, color: kNavy)),
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -77,7 +100,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             children: [
               const Text(
                 'Join TikCare LifePulse',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: _navy),
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: kNavy),
               ),
               const SizedBox(height: 6),
               const Text(
@@ -145,7 +168,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: _navy,
+                  backgroundColor: kNavy,
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -156,6 +179,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
                     ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                     : const Text('Create Account', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
               ),
+              if (_slowHint) ...[
+                const SizedBox(height: 10),
+                const Text(
+                  'Taking a moment — server may be warming up…',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
             ],
           ),
         ),
@@ -170,7 +201,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
       suffixIcon: suffix,
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Color(0xFFE2E8F0))),
       enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Color(0xFFE2E8F0))),
-      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: _navy, width: 1.5)),
+      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: kNavy, width: 1.5)),
       filled: true,
       fillColor: Colors.white,
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),

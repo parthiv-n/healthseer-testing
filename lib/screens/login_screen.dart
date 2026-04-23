@@ -1,7 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../services/health_service.dart';
-
-const _navy = Color(0xFF1B3A6B);
+import '../theme/colors.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -14,11 +14,14 @@ class _LoginScreenState extends State<LoginScreen> {
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   bool _loading = false;
+  bool _slowHint = false;
   String? _error;
   bool _obscure = true;
+  Timer? _slowHintTimer;
 
   @override
   void dispose() {
+    _slowHintTimer?.cancel();
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     super.dispose();
@@ -31,24 +34,45 @@ class _LoginScreenState extends State<LoginScreen> {
       setState(() => _error = 'Please enter your email and password.');
       return;
     }
-    setState(() { _loading = true; _error = null; });
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      setState(() => _error = 'Please enter a valid email address.');
+      return;
+    }
+    setState(() { _loading = true; _error = null; _slowHint = false; });
+    // After 8s, show a hint that the server may be warming up
+    _slowHintTimer?.cancel();
+    _slowHintTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted && _loading) setState(() => _slowHint = true);
+    });
 
-    final result = await HealthService.login(email: email, password: password);
+    try {
+      final result = await HealthService.login(email: email, password: password);
 
-    if (!mounted) return;
-    if (result.success) {
-      await HealthService.registerBackgroundSync();
+      _slowHintTimer?.cancel();
       if (!mounted) return;
-      Navigator.pushReplacementNamed(context, '/home');
-    } else {
-      setState(() { _loading = false; _error = result.message; });
+      if (result.success) {
+        try {
+          await HealthService.registerBackgroundSync();
+        } catch (_) {
+          // Background sync registration is best-effort; proceed to home regardless.
+        }
+        if (!mounted) return;
+        Navigator.pushReplacementNamed(context, '/home');
+      } else {
+        setState(() { _loading = false; _slowHint = false; _error = result.message; });
+      }
+    } catch (e) {
+      _slowHintTimer?.cancel();
+      if (mounted) {
+        setState(() { _loading = false; _slowHint = false; _error = 'An unexpected error occurred. Please try again.'; });
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF7F9FC),
+      backgroundColor: kBg,
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 48),
@@ -68,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       width: 200,
                       height: 60,
                       decoration: BoxDecoration(
-                        color: _navy,
+                        color: kNavy,
                         borderRadius: BorderRadius.circular(12),
                       ),
                       child: const Icon(Icons.favorite, color: Colors.white, size: 36),
@@ -83,7 +107,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   style: TextStyle(
                     fontSize: 24,
                     fontWeight: FontWeight.w800,
-                    color: _navy,
+                    color: kNavy,
                     letterSpacing: -0.5,
                   ),
                 ),
@@ -150,7 +174,7 @@ class _LoginScreenState extends State<LoginScreen> {
               // Sign in button
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: _navy,
+                  backgroundColor: kNavy,
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -168,14 +192,32 @@ class _LoginScreenState extends State<LoginScreen> {
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
                       ),
               ),
+              if (_slowHint) ...[
+                const SizedBox(height: 10),
+                const Text(
+                  'Taking a moment — server may be warming up…',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
 
-              const SizedBox(height: 20),
+              const SizedBox(height: 8),
+              Center(
+                child: TextButton(
+                  onPressed: () => Navigator.pushNamed(context, '/forgot-password'),
+                  child: const Text(
+                    'Forgot password?',
+                    style: TextStyle(fontSize: 13, color: Colors.grey),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 4),
               Center(
                 child: TextButton(
                   onPressed: () => Navigator.pushNamed(context, '/register'),
                   child: const Text(
-                    'New tester? Create an account',
-                    style: TextStyle(fontSize: 13, color: _navy),
+                    'New here? Create an account',
+                    style: TextStyle(fontSize: 13, color: kNavy),
                   ),
                 ),
               ),
@@ -209,7 +251,7 @@ class _LoginScreenState extends State<LoginScreen> {
       ),
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: _navy, width: 1.5),
+        borderSide: const BorderSide(color: kNavy, width: 1.5),
       ),
       filled: true,
       fillColor: Colors.white,

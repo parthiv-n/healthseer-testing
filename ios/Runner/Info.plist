@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Lifepulse Test App</string>
+	<string>TikCare LifePulse</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>lifepulse_test_app</string>
+	<string>TikCare LifePulse</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -46,11 +46,15 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 
+	<!-- Export compliance: app uses only standard HTTPS/TLS (Apple OS encryption) -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+
 	<!-- HealthKit permissions (required by Apple App Review) -->
 	<key>NSHealthShareUsageDescription</key>
-	<string>LifePulse reads your health data to calculate a health risk score for your insurance plan.</string>
+	<string>TikCare LifePulse reads your health data to calculate a health risk score for your insurance plan.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>LifePulse only reads health data and never writes to it.</string>
+	<string>TikCare LifePulse may save activity summaries to Apple Health for your reference.</string>
 
 	<!-- Background sync -->
 	<key>UIBackgroundModes</key>

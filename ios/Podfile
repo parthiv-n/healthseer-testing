@@ -1,5 +1,5 @@
 # Uncomment this line to define a global platform for your project
-# platform :ios, '12.0'
+platform :ios, '14.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -27,6 +27,20 @@ require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelpe
 
 flutter_ios_podfile_setup
 
+# Patch health plugin: change framework-style import to relative import so the
+# Xcode-generated health-Swift.h (placed in DerivedSources/) can be found.
+pre_install do |installer|
+  health_plugin_m = File.join(
+    installer.config.project_root,
+    '.symlinks/plugins/health/ios/Classes/HealthPlugin.m'
+  )
+  if File.exist?(health_plugin_m)
+    content = File.read(health_plugin_m)
+    patched  = content.gsub('#import <health/health-Swift.h>', '#import "health-Swift.h"')
+    File.write(health_plugin_m, patched) if patched != content
+  end
+end
+
 target 'Runner' do
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
@@ -37,5 +51,14 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+    target.build_configurations.each do |config|
+      # Add build products dir to header search paths so <health/health-Swift.h>
+      # (and similar generated Swift-ObjC headers) can be found at build time.
+      config.build_settings['HEADER_SEARCH_PATHS'] =
+        '$(inherited) $(PODS_CONFIGURATION_BUILD_DIR)'
+      if ['health', 'workmanager'].include?(target.name)
+        config.build_settings['DEFINES_MODULE'] = 'YES'
+      end
+    end
   end
 end

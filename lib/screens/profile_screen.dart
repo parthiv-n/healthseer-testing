@@ -1,11 +1,10 @@
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../services/health_service.dart';
 import '../models/daily_report.dart';
-
-const _navy = Color(0xFF1B3A6B);
-const _navyLight = Color(0xFF2A5298);
-const _bg = Color(0xFFF7F9FC);
+import '../theme/colors.dart';
 
 class ProfileScreen extends StatefulWidget {
   final SharedPreferences prefs;
@@ -19,9 +18,18 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String? _email;
   Map<String, dynamic>? _profile;
   DailyReport? _dailyReport;
+  bool _loadingProfile = true;
+  bool _profileLoadError = false;
   bool _showDebugLog = false;
   bool _testing = false;
+  bool _resyncingHistorical = false;
   bool? _testSuccess;
+
+  // Sync history (last sync only — stored by HomeScreen)
+  String? _lastSyncTime;
+  int? _lastSyncEventCount;
+  bool? _lastSyncSuccess;
+  List<String> _lastSyncDevices = [];
 
   @override
   void initState() {
@@ -30,20 +38,31 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _load() async {
-    final email = await HealthService.getLoggedInEmail();
-    final prefs = await SharedPreferences.getInstance();
-    final showLog = prefs.getBool('show_debug_log') ?? false;
-    final results = await Future.wait([
-      HealthService.fetchUserProfile(),
-      HealthService.fetchDailyReport(),
-    ]);
-    if (mounted) {
-      setState(() {
-        _email = email;
-        _showDebugLog = showLog;
-        _profile = results[0] as Map<String, dynamic>?;
-        _dailyReport = results[1] as DailyReport?;
-      });
+    setState(() { _loadingProfile = true; _profileLoadError = false; });
+    try {
+      final email = await HealthService.getLoggedInEmail();
+      final prefs = await SharedPreferences.getInstance();
+      final showLog = prefs.getBool('show_debug_log') ?? false;
+      final results = await Future.wait([
+        HealthService.fetchUserProfile(),
+        HealthService.fetchDailyReport(),
+      ]);
+      if (mounted) {
+        setState(() {
+          _loadingProfile = false;
+          _email = email;
+          _showDebugLog = showLog;
+          _profile = results[0] as Map<String, dynamic>?;
+          _dailyReport = results[1] as DailyReport?;
+          _lastSyncTime = prefs.getString('last_sync_time');
+          _lastSyncEventCount = prefs.getInt('last_event_count');
+          _lastSyncSuccess = prefs.getBool('last_sync_success');
+          _lastSyncDevices = prefs.getStringList('last_sync_devices') ?? [];
+        });
+      }
+    } catch (e) {
+      debugPrint('[ProfileScreen._load] $e');
+      if (mounted) setState(() { _loadingProfile = false; _profileLoadError = true; });
     }
   }
 
@@ -53,10 +72,42 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (mounted) setState(() => _showDebugLog = value);
   }
 
-  Future<void> _testConnection() async {
-    setState(() { _testing = true; _testSuccess = null; });
-    final result = await HealthService.pingLifePulse();
-    if (mounted) setState(() { _testing = false; _testSuccess = result.success; });
+  Future<void> _resyncHistorical() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(children: [
+          Icon(Icons.history, color: kNavy, size: 20),
+          SizedBox(width: 8),
+          Text('Re-sync Historical Data', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+        ]),
+        content: const Text(
+          'This will re-upload the last 365 days from Apple Health to fill any gaps. It runs in weekly chunks so it\'s safe to interrupt — progress is saved.\n\nDuplicate data is automatically filtered.',
+          style: TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Re-sync', style: TextStyle(color: kNavy, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _resyncingHistorical = true);
+    final result = await HealthService.syncDirect(forceFullResync: true);
+    if (!mounted) return;
+    setState(() => _resyncingHistorical = false);
+
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(result.success
+          ? 'Historical re-sync complete. New data will appear shortly.'
+          : 'Re-sync failed: ${result.message}'),
+      backgroundColor: result.success ? Colors.green : Colors.red,
+    ));
   }
 
   Future<void> _clearMyData() async {
@@ -83,10 +134,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
       ),
     );
     if (confirmed != true || !mounted) return;
-
     final result = await HealthService.clearMyData();
     if (!mounted) return;
-
     if (result != null) {
       final deleted = result['deleted'] as Map<String, dynamic>? ?? {};
       final events = (deleted['canonical_events'] as int?) ?? 0;
@@ -98,6 +147,52 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } else {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text('Failed to clear data. Check your connection.'),
+        backgroundColor: Colors.red,
+      ));
+    }
+  }
+
+  Future<void> _testConnection() async {
+    setState(() { _testing = true; _testSuccess = null; });
+    final result = await HealthService.pingLifePulse();
+    if (mounted) setState(() { _testing = false; _testSuccess = result.success; });
+  }
+
+  Future<void> _deleteAccount() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(children: [
+          Icon(Icons.warning_amber_rounded, color: Colors.red, size: 20),
+          SizedBox(width: 8),
+          Text('Delete Account', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+        ]),
+        content: const Text(
+          'This will permanently delete your account and all associated health data.\n\nThis action cannot be undone.',
+          style: TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete Account', style: TextStyle(color: Colors.red, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final success = await HealthService.deleteAccount();
+    if (!mounted) return;
+    if (success) {
+      try {
+        await HealthService.clearAllCaches();
+        await HealthService.logout();
+      } catch (_) { /* best-effort */ }
+      if (mounted) Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Unable to delete account. Please contact support@tikcare.co.'),
         backgroundColor: Colors.red,
       ));
     }
@@ -120,6 +215,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       ),
     );
     if (confirmed == true && mounted) {
+      await HealthService.clearAllCaches();
       await HealthService.logout();
       if (mounted) Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
     }
@@ -132,19 +228,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final displayName = [firstName, lastName].where((s) => s.isNotEmpty).join(' ');
 
     return Scaffold(
-      backgroundColor: _bg,
+      backgroundColor: kBg,
       body: CustomScrollView(
         slivers: [
           SliverAppBar(
             expandedHeight: 100,
             pinned: true,
-            backgroundColor: _navy,
+            backgroundColor: kNavy,
             automaticallyImplyLeading: false,
             flexibleSpace: FlexibleSpaceBar(
               background: Container(
                 decoration: const BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [_navy, _navyLight],
+                    colors: [kNavy, kNavyLight],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -165,6 +261,55 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ),
             ),
           ),
+          if (_loadingProfile)
+            const SliverFillRemaining(
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(color: kNavy, strokeWidth: 2),
+                    SizedBox(height: 16),
+                    Text('Loading profile…', style: TextStyle(fontSize: 13, color: Colors.grey)),
+                  ],
+                ),
+              ),
+            )
+          else if (_profileLoadError)
+            SliverFillRemaining(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(32),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.cloud_off_outlined, size: 48, color: Colors.grey),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Could not load profile',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: kNavy),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Check your connection and try again.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 13, color: Colors.grey),
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton.icon(
+                        onPressed: _load,
+                        icon: const Icon(Icons.refresh, size: 16),
+                        label: const Text('Retry'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: kNavy,
+                          foregroundColor: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else
           SliverToBoxAdapter(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 40),
@@ -178,7 +323,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           width: 56,
                           height: 56,
                           decoration: const BoxDecoration(
-                            gradient: LinearGradient(colors: [_navy, _navyLight]),
+                            gradient: LinearGradient(colors: [kNavy, kNavyLight]),
                             shape: BoxShape.circle,
                           ),
                           child: Center(
@@ -195,7 +340,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             children: [
                               Text(
                                 displayName.isNotEmpty ? displayName : (_email ?? 'Member'),
-                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: _navy),
+                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: kNavy),
                               ),
                               if (_email != null)
                                 Text(_email!, style: const TextStyle(fontSize: 12, color: Colors.grey)),
@@ -206,7 +351,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                   color: const Color(0xFFEEF2FF),
                                   borderRadius: BorderRadius.circular(8),
                                 ),
-                                child: const Text('TikCare Member', style: TextStyle(fontSize: 10, color: _navy, fontWeight: FontWeight.w600)),
+                                child: const Text('TikCare Member', style: TextStyle(fontSize: 10, color: kNavy, fontWeight: FontWeight.w600)),
                               ),
                             ],
                           ),
@@ -224,11 +369,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       children: [
                         _SectionLabel(label: 'DATA & PRIVACY'),
                         const SizedBox(height: 12),
-                        _InfoRow(icon: Icons.shield_outlined, label: 'Data shared with TikCare', value: 'Heart Rate, HRV, Steps, SpO2, Active & Basal Energy, Resting HR, Distance, Floors Climbed, Exercise Time, Sleep, Resp. Rate (S6+)'),
+                        _InfoRow(icon: Icons.shield_outlined, label: 'Data shared with TikCare', value: 'Heart Rate, HRV, Steps, SpO₂, Resting HR, Exercise Time, Sleep, Resp. Rate*, Blood Pressure, AFib History\n*Resp. Rate requires Apple Watch Series 6+'),
                         const Divider(height: 20),
                         _InfoRow(icon: Icons.lock_outline, label: 'Data use', value: 'Health risk scoring & anomaly detection only'),
                         const Divider(height: 20),
                         _InfoRow(icon: Icons.visibility_off_outlined, label: 'Not shared', value: 'GPS location, contacts, photos'),
+                        const Divider(height: 20),
+                        GestureDetector(
+                          onTap: () async {
+                            final uri = Uri.parse('https://tikcare.co/privacy');
+                            if (await canLaunchUrl(uri)) {
+                              await launchUrl(uri, mode: LaunchMode.externalApplication);
+                            }
+                          },
+                          child: const Row(
+                            children: [
+                              Icon(Icons.policy_outlined, size: 16, color: Colors.grey),
+                              SizedBox(width: 10),
+                              Expanded(child: Text('Privacy Policy', style: TextStyle(fontSize: 13, color: kNavy))),
+                              Icon(Icons.open_in_new, size: 14, color: Colors.grey),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -238,6 +400,57 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   // Health Profile Maturity
                   if (_dailyReport != null)
                     _MaturityCard(report: _dailyReport!),
+
+                  const SizedBox(height: 12),
+
+                  // Sync History
+                  if (_lastSyncTime != null)
+                    _SyncHistoryCard(
+                      lastSyncTime: _lastSyncTime!,
+                      eventCount: _lastSyncEventCount,
+                      success: _lastSyncSuccess ?? false,
+                      devices: _lastSyncDevices,
+                    ),
+
+                  if (_lastSyncTime != null) const SizedBox(height: 12),
+
+                  // Re-sync historical data
+                  _Card(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _SectionLabel(label: 'HISTORICAL DATA'),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Missing past health data? Re-sync uploads the last 180 days from Apple Health to fill any gaps.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey, height: 1.4),
+                        ),
+                        const SizedBox(height: 12),
+                        ValueListenableBuilder<String?>(
+                          valueListenable: HealthService.historicalSyncProgress,
+                          builder: (_, progress, __) {
+                            final label = progress ?? (_resyncingHistorical ? 'Starting…' : 'Re-sync Historical Data');
+                            final busy = _resyncingHistorical;
+                            return SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: busy ? null : _resyncHistorical,
+                                icon: busy
+                                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                                    : const Icon(Icons.history, size: 16),
+                                label: Text(label),
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: kNavy,
+                                  side: const BorderSide(color: kNavy),
+                                  padding: const EdgeInsets.symmetric(vertical: 10),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
 
                   const SizedBox(height: 12),
 
@@ -254,15 +467,15 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             const SizedBox(width: 8),
                             const Expanded(child: Text('LifePulse API', style: TextStyle(fontSize: 13))),
                             if (_testing)
-                              const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: _navy))
+                              const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: kNavy))
                             else if (_testSuccess == true)
-                              const Icon(Icons.check_circle, size: 16, color: Color(0xFF38A169))
+                              const Icon(Icons.check_circle, size: 16, color: kGreen)
                             else if (_testSuccess == false)
                               const Icon(Icons.error_outline, size: 16, color: Colors.red),
                             const SizedBox(width: 8),
                             GestureDetector(
                               onTap: _testing ? null : _testConnection,
-                              child: const Text('Test', style: TextStyle(fontSize: 12, color: _navy, fontWeight: FontWeight.w600)),
+                              child: const Text('Test', style: TextStyle(fontSize: 12, color: kNavy, fontWeight: FontWeight.w600)),
                             ),
                           ],
                         ),
@@ -275,8 +488,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             Switch.adaptive(
                               value: _showDebugLog,
                               onChanged: _toggleDebugLog,
-                              activeThumbColor: _navy,
-                              activeTrackColor: _navy.withValues(alpha: 0.4),
+                              activeThumbColor: kNavy,
+                              activeTrackColor: kNavy.withValues(alpha: 0.4),
                             ),
                           ],
                         ),
@@ -286,8 +499,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
                   const SizedBox(height: 12),
 
-                  // DEV ONLY: Clear My Data
-                  Container(
+                  // DEV ONLY — hidden in release/TestFlight/App Store builds.
+                  if (kDebugMode) Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
@@ -345,11 +558,95 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     ),
                   ),
 
-                  const SizedBox(height: 12),
-                  const Text('TikCare LifePulse v1.0', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  const SizedBox(height: 8),
+                  // Account deletion — required by App Store guidelines
+                  Center(
+                    child: TextButton(
+                      onPressed: _deleteAccount,
+                      child: const Text(
+                        'Delete Account',
+                        style: TextStyle(fontSize: 12, color: Colors.red),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 4),
+                  const Text('TikCare LifePulse v1.0.0 (7)', style: TextStyle(fontSize: 11, color: Colors.grey)),
                 ],
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Sync History Card ─────────────────────────────────────────────────────────
+
+class _SyncHistoryCard extends StatelessWidget {
+  final String lastSyncTime;
+  final int? eventCount;
+  final bool success;
+  final List<String> devices;
+
+  const _SyncHistoryCard({
+    required this.lastSyncTime,
+    required this.eventCount,
+    required this.success,
+    required this.devices,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = success ? kGreen : kRed;
+    final deviceLabel = devices.isEmpty
+        ? 'No devices recorded'
+        : devices.length == 1
+            ? devices.first
+            : '${devices.first} + ${devices.length - 1} more';
+
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _SectionLabel(label: 'LAST SYNC'),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Icon(
+                success ? Icons.check_circle_outline : Icons.error_outline,
+                size: 15,
+                color: color,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  success ? 'Completed · $lastSyncTime' : 'Failed · $lastSyncTime',
+                  style: TextStyle(fontSize: 13, color: color, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          if (eventCount != null && success) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                const Icon(Icons.upload_outlined, size: 15, color: Colors.grey),
+                const SizedBox(width: 8),
+                Text('$eventCount health events uploaded', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+            ),
+          ],
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              const Icon(Icons.watch_outlined, size: 15, color: Colors.grey),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(deviceLabel, style: const TextStyle(fontSize: 12, color: Colors.grey), overflow: TextOverflow.ellipsis),
+              ),
+            ],
           ),
         ],
       ),
@@ -405,7 +702,7 @@ class _InfoRow extends StatelessWidget {
             children: [
               Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
               const SizedBox(height: 2),
-              Text(value, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: _navy)),
+              Text(value, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: kNavy)),
             ],
           ),
         ),
@@ -431,19 +728,19 @@ class _MaturityCard extends StatelessWidget {
           'Established',
           'Your personal health baseline is fully built.',
           1.0,
-          const Color(0xFF38A169),
+          kGreen,
         ),
       'developing' => (
           'Developing',
-          '$days of 30 days synced. Keep syncing daily to improve accuracy.',
+          '${days.clamp(0, 30)} of 30 days synced. Keep syncing daily to improve accuracy.',
           days / 30.0,
-          const Color(0xFFD97706),
+          kAmber,
         ),
       _ => (
           'Building Baseline',
-          '$days of 14 days synced. Sync daily so TikCare can learn your patterns.',
+          '${days.clamp(0, 14)} of 14 days synced. Sync daily so TikCare can learn your patterns.',
           days / 14.0,
-          const Color(0xFF2A5298),
+          kNavyLight,
         ),
     };
 

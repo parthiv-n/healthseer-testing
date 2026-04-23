@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/health_service.dart';
-
-const _navy = Color(0xFF1B3A6B);
-const _navyLight = Color(0xFF2A5298);
+import '../theme/colors.dart';
 
 /// Branded splash screen shown for ~1.2 seconds while auth state is checked.
 /// Navigates to /home if logged in, otherwise /login.
@@ -47,7 +45,20 @@ class _SplashScreenState extends State<SplashScreen>
     if (!mounted) return;
     final loggedIn = await HealthService.isLoggedIn();
     if (!mounted) return;
-    Navigator.pushReplacementNamed(context, loggedIn ? '/home' : '/login');
+    if (loggedIn) {
+      // Proactively refresh token — if near expiry or expired, attempt renewal
+      // before entering the app so the first data fetch doesn't hit 401.
+      await HealthService.refreshTokenIfNeeded();
+      if (!mounted) return;
+      // Re-check after refresh: if the token was expired and the refresh failed
+      // (e.g., network offline), the stored token was cleared. Navigate directly
+      // to login rather than letting the home screen flicker and then kick out.
+      final stillLoggedIn = await HealthService.isLoggedIn();
+      if (!mounted) return;
+      Navigator.pushReplacementNamed(context, stillLoggedIn ? '/home' : '/login');
+    } else {
+      Navigator.pushReplacementNamed(context, '/login');
+    }
   }
 
   @override
@@ -62,7 +73,7 @@ class _SplashScreenState extends State<SplashScreen>
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            colors: [_navy, _navyLight, Color(0xFF3A6BC4)],
+            colors: [kNavy, kNavyLight, Color(0xFF3A6BC4)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),

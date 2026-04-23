@@ -215,3 +215,35 @@ class DailyReport {
     );
   }
 }
+
+/// Local HealthKit daily metric aggregate — used for per-metric trend charts.
+class DailyMetricPoint {
+  final DateTime date;
+  final double? avgHr;
+  final double? hrv;
+  final int? steps;
+  final double? sleepHours;
+  final double? rhr;
+  final double? spo2;
+  final int? exerciseMin;
+  final double? respRate;
+  final bool? afibDetected;
+
+  const DailyMetricPoint({
+    required this.date,
+    this.avgHr,
+    this.hrv,
+    this.steps,
+    this.sleepHours,
+    this.rhr,
+    this.spo2,
+    this.exerciseMin,
+    this.respRate,
+    this.afibDetected,
+  });
+
+  bool get hasAnyData =>
+      avgHr != null || hrv != null || steps != null || sleepHours != null ||
+      rhr != null || spo2 != null || exerciseMin != null || respRate != null ||
+      afibDetected != null;
+}

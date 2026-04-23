@@ -5,8 +5,16 @@ class RiskInsight {
   final String hriLabel;        // low | moderate | high | critical
   final Map<String, int> anomalyBreakdown;  // mild/moderate/severe → count
   final List<Map<String, dynamic>> latestAnomalies; // up to 3 recent alerts
-  final double? fraudRiskScore;  // 0.0-1.0 from most recent sync
+  // fraudRiskScore is an insurer-side actuarial signal — NEVER display this
+  // to the member. It is retained here only for schema compatibility with the
+  // backend response; it must not be surfaced in any member-facing UI widget.
+  final double? fraudRiskScore;
   final DateTime fetchedAt;
+
+  // Baseline maturity — drives cold-start UX messaging
+  final String baselineMaturity;        // cold_start | developing | established
+  final int daysWithData;               // distinct calendar days synced so far
+  final String? estimatedEstablishedDate; // ISO-8601 date when HRI will fully activate
 
   const RiskInsight({
     required this.hriScore,
@@ -15,14 +23,10 @@ class RiskInsight {
     required this.latestAnomalies,
     this.fraudRiskScore,
     required this.fetchedAt,
+    this.baselineMaturity = 'cold_start',
+    this.daysWithData = 0,
+    this.estimatedEstablishedDate,
   });
-
-  String get fraudRiskLabel {
-    if (fraudRiskScore == null) return 'Unknown';
-    if (fraudRiskScore! < 0.3) return 'Low';
-    if (fraudRiskScore! < 0.6) return 'Medium';
-    return 'High';
-  }
 
   bool get hasAlerts =>
       latestAnomalies.isNotEmpty ||

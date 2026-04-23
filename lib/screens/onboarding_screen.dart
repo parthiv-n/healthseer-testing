@@ -1,9 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-
-const _navy = Color(0xFF1B3A6B);
-const _navyLight = Color(0xFF2A5298);
-const _bg = Color(0xFFF7F9FC);
+import '../theme/colors.dart';
 
 /// Three-page onboarding shown once on first app launch.
 /// On "Get Started", saves [onboarding_done] = true then navigates to /login.
@@ -25,7 +22,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       subtitle:
           'TikCare LifePulse intelligently analyzes your wearable health data '
           'to help your insurance provider understand and support your wellbeing.',
-      iconColor: Color(0xFFE53E3E),
+      iconColor: kRed,
     ),
     _OnboardingPage(
       icon: Icons.sync_rounded,
@@ -34,16 +31,17 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           'Your Apple Watch or wearable syncs health metrics every 6 hours. '
           'TikCare AI analyzes patterns like heart rate, HRV, sleep, and activity '
           'to detect meaningful changes and generate your Health Risk Index.',
-      iconColor: Color(0xFF2A5298),
+      iconColor: kNavyLight,
     ),
     _OnboardingPage(
       icon: Icons.shield_outlined,
       title: 'Your privacy',
       subtitle:
-          'Your data belongs to your insurer and is used only for health risk '
-          'scoring. GPS location, contacts, and photos are never accessed. '
-          'You may request deletion of your data at any time.',
-      iconColor: Color(0xFF38A169),
+          'Your health data is shared with your insurance provider solely for '
+          'risk scoring and wellbeing support. GPS location, contacts, and '
+          'photos are never accessed. You may request deletion of your data '
+          'at any time.',
+      iconColor: kGreen,
     ),
   ];
 
@@ -53,7 +51,11 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     super.dispose();
   }
 
+  bool _navigating = false;
+
   Future<void> _onGetStarted() async {
+    if (_navigating) return;
+    _navigating = true;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('onboarding_done', true);
     if (mounted) {
@@ -73,7 +75,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     final isLast = _currentPage == _pages.length - 1;
 
     return Scaffold(
-      backgroundColor: _bg,
+      backgroundColor: kBg,
       body: SafeArea(
         child: Column(
           children: [
@@ -118,7 +120,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     child: ElevatedButton(
                       onPressed: isLast ? _onGetStarted : _nextPage,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: _navy,
+                        backgroundColor: kNavy,
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(14),
@@ -197,7 +199,7 @@ class _PageContent extends StatelessWidget {
             style: const TextStyle(
               fontSize: 26,
               fontWeight: FontWeight.w800,
-              color: _navy,
+              color: kNavy,
               letterSpacing: -0.4,
               height: 1.2,
             ),
@@ -226,7 +228,7 @@ class _PageContent extends StatelessWidget {
                 height: 24,
                 decoration: BoxDecoration(
                   gradient: const LinearGradient(
-                    colors: [_navy, _navyLight],
+                    colors: [kNavy, kNavyLight],
                   ),
                   shape: BoxShape.circle,
                 ),
@@ -237,7 +239,7 @@ class _PageContent extends StatelessWidget {
                 'TikCare LifePulse',
                 style: TextStyle(
                   fontSize: 13,
-                  color: _navy,
+                  color: kNavy,
                   fontWeight: FontWeight.w600,
                 ),
               ),
@@ -268,7 +270,7 @@ class _DotIndicator extends StatelessWidget {
           width: isActive ? 22 : 7,
           height: 7,
           decoration: BoxDecoration(
-            color: isActive ? _navy : Colors.grey.shade300,
+            color: isActive ? kNavy : Colors.grey.shade300,
             borderRadius: BorderRadius.circular(4),
           ),
         );

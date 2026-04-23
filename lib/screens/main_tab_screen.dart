@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../services/health_service.dart';
 import 'home_screen.dart';
 import 'trends_screen.dart';
 import 'alerts_screen.dart';
 import 'profile_screen.dart';
 import 'risk_domains_screen.dart';
-
-const _navy = Color(0xFF1B3A6B);
+import '../theme/colors.dart';
 
 /// Root tab navigator: Today | Trends | Alerts | Profile
 class MainTabScreen extends StatefulWidget {
@@ -20,22 +20,46 @@ class MainTabScreen extends StatefulWidget {
 
 class _MainTabScreenState extends State<MainTabScreen> {
   late int _currentIndex;
+  late List<Widget> _screens;
 
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialTab;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final screens = [
+    _screens = [
       HomeScreen(prefs: widget.prefs),
       const TrendsScreen(),
       const AlertsScreen(),
       const RiskDomainsScreen(),
       ProfileScreen(prefs: widget.prefs),
     ];
+    HealthService.sessionExpired.addListener(_onSessionExpired);
+  }
+
+  @override
+  void dispose() {
+    HealthService.sessionExpired.removeListener(_onSessionExpired);
+    super.dispose();
+  }
+
+  bool _sessionExpiredHandled = false;
+
+  void _onSessionExpired() {
+    if (_sessionExpiredHandled || !HealthService.sessionExpired.value || !mounted) return;
+    _sessionExpiredHandled = true;
+    HealthService.sessionExpired.value = false;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('Session expired — please sign in again.'),
+        backgroundColor: kOrange,
+      ),
+    );
+    Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screens = _screens;
 
     return Scaffold(
       body: IndexedStack(
@@ -44,12 +68,13 @@ class _MainTabScreenState extends State<MainTabScreen> {
       ),
       bottomNavigationBar: Container(
         decoration: BoxDecoration(
-          color: Colors.white,
-          boxShadow: [
+          color: kCardBg,
+          border: const Border(top: BorderSide(color: kBorderColor, width: 1)),
+          boxShadow: const [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.06),
-              blurRadius: 12,
-              offset: const Offset(0, -3),
+              color: kShadowColor,
+              blurRadius: 24,
+              offset: Offset(0, -4),
             ),
           ],
         ),
@@ -104,7 +129,7 @@ class _NavItem extends StatelessWidget {
             Icon(
               isActive ? activeIcon : icon,
               size: 24,
-              color: isActive ? _navy : Colors.grey.shade400,
+              color: isActive ? kNavy : Colors.grey.shade400,
             ),
             const SizedBox(height: 3),
             Text(
@@ -112,7 +137,7 @@ class _NavItem extends StatelessWidget {
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
-                color: isActive ? _navy : Colors.grey.shade400,
+                color: isActive ? kNavy : Colors.grey.shade400,
               ),
             ),
           ],

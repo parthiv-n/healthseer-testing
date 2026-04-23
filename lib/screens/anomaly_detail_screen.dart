@@ -1,12 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/anomaly_item.dart';
-
-const _navy = Color(0xFF1B3A6B);
-const _navyLight = Color(0xFF2A5298);
-const _amber = Color(0xFFD97706);
-const _red = Color(0xFFE53E3E);
-const _orange = Color(0xFFDD6B20);
-const _bg = Color(0xFFF7F9FC);
+import '../theme/colors.dart';
 
 // ── Lookup tables ─────────────────────────────────────────────────────────────
 
@@ -62,6 +56,25 @@ const _anomalyExplanations = {
   'VO2_MAX':
       'Your estimated VO\u2082 Max changed from your personal baseline. '
       'VO\u2082 Max reflects cardiovascular fitness and changes slowly over weeks to months.',
+  'DISTANCE_DELTA':
+      'Your total distance traveled was significantly different from your typical day. '
+      'This may reflect an unusually active or sedentary day, travel, illness, or a change in routine. '
+      'TikCare compares this against your personal rolling average.',
+  'FLOORS_CLIMBED':
+      'The number of floors you climbed was significantly different from your typical pattern. '
+      'This may reflect a change in environment, routine, or physical capability. '
+      'A single unusual day is generally not a concern.',
+  'EXERCISE_TIME':
+      'Your recorded exercise duration was significantly different from your baseline. '
+      'A notable drop may reflect illness, fatigue, or schedule changes. '
+      'An unusually high reading may indicate an intense training day or data from a new activity type.',
+  'ENERGY_BASAL':
+      'Your basal metabolic energy output shifted from your baseline. '
+      'Basal energy reflects the calories your body burns at rest, which can vary with sleep quality, '
+      'body temperature, and overall health status.',
+  'SLEEP_STAGE':
+      'Your sleep duration or quality was significantly different from your personal baseline. '
+      'Sleep anomalies can reflect disrupted rest, illness, travel across time zones, or irregular bedtimes.',
 };
 
 const _anomalyGuidance = {
@@ -109,6 +122,21 @@ const _anomalyGuidance = {
   'VO2_MAX_mild': 'Normal variation. VO\u2082 Max changes slowly over weeks.',
   'VO2_MAX_moderate': 'Monitor trend over the next few weeks.',
   'VO2_MAX_severe': 'Consult a doctor if a large drop accompanies other symptoms.',
+  'DISTANCE_DELTA_mild': 'Normal variation — a single unusual day requires no action.',
+  'DISTANCE_DELTA_moderate': 'Check whether you are feeling well. If sedentary due to illness, rest as needed.',
+  'DISTANCE_DELTA_severe': 'Significant deviation from your routine — confirm you are feeling well and that data is accurate.',
+  'FLOORS_CLIMBED_mild': 'Normal variation — no action needed.',
+  'FLOORS_CLIMBED_moderate': 'No action needed for a single day. Monitor if the pattern continues.',
+  'FLOORS_CLIMBED_severe': 'Unusual activity change — verify data accuracy and check in on your wellbeing.',
+  'EXERCISE_TIME_mild': 'Normal variation — no action needed.',
+  'EXERCISE_TIME_moderate': 'If this reflects reduced activity due to illness or fatigue, rest and recover.',
+  'EXERCISE_TIME_severe': 'A large change in exercise time — check you are feeling well and that all activity was recorded correctly.',
+  'ENERGY_BASAL_mild': 'Normal day-to-day variation — no action needed.',
+  'ENERGY_BASAL_moderate': 'Ensure you are well-rested and healthy. Unusual basal energy can accompany illness.',
+  'ENERGY_BASAL_severe': 'Persistent changes in basal energy may warrant a check-in with your doctor.',
+  'SLEEP_STAGE_mild': 'An occasional off night is normal. Aim for consistent sleep times.',
+  'SLEEP_STAGE_moderate': 'Try to prioritize 7–9 hours of sleep. Avoid screens before bed and keep a regular schedule.',
+  'SLEEP_STAGE_severe': 'Severely disrupted sleep can affect your overall health. If this persists, consult a doctor.',
 };
 
 // ── Screen ────────────────────────────────────────────────────────────────────
@@ -117,11 +145,7 @@ class AnomalyDetailScreen extends StatelessWidget {
   final AnomalyItem anomaly;
   const AnomalyDetailScreen({super.key, required this.anomaly});
 
-  Color get _severityColor => switch (anomaly.severity) {
-        'severe' => _red,
-        'moderate' => _orange,
-        _ => _amber,
-      };
+  Color get _severityColor => anomaly.severityColor;
 
   String get _displayName =>
       _metricDisplayNames[anomaly.metricType] ?? anomaly.metricLabel;
@@ -145,13 +169,13 @@ class AnomalyDetailScreen extends StatelessWidget {
         '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
     return Scaffold(
-      backgroundColor: _bg,
+      backgroundColor: kBg,
       body: CustomScrollView(
         slivers: [
           SliverAppBar(
             expandedHeight: 100,
             pinned: true,
-            backgroundColor: _navy,
+            backgroundColor: kNavy,
             leading: IconButton(
               icon: const Icon(Icons.arrow_back, color: Colors.white),
               onPressed: () => Navigator.pop(context),
@@ -160,7 +184,7 @@ class AnomalyDetailScreen extends StatelessWidget {
               background: Container(
                 decoration: const BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [_navy, _navyLight],
+                    colors: [kNavy, kNavyLight],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -209,7 +233,7 @@ class AnomalyDetailScreen extends StatelessWidget {
                             shape: BoxShape.circle,
                           ),
                           child: Icon(
-                            _metricIcon(anomaly.metricType),
+                            anomaly.metricIcon,
                             size: 24,
                             color: color,
                           ),
@@ -224,7 +248,7 @@ class AnomalyDetailScreen extends StatelessWidget {
                                 style: const TextStyle(
                                   fontSize: 16,
                                   fontWeight: FontWeight.w700,
-                                  color: _navy,
+                                  color: kNavy,
                                 ),
                               ),
                               const SizedBox(height: 2),
@@ -238,7 +262,7 @@ class AnomalyDetailScreen extends StatelessWidget {
                             ],
                           ),
                         ),
-                        _SeverityBadge(severity: anomaly.severity, color: color),
+                        _SeverityBadge(label: anomaly.severityDisplay, color: color),
                       ],
                     ),
                   ),
@@ -266,9 +290,9 @@ class AnomalyDetailScreen extends StatelessWidget {
                             Expanded(
                               child: _ValueTile(
                                 label: 'Direction',
-                                value: anomaly.zScore > 0 ? '↑ High' : '↓ Low',
+                                value: anomaly.zScore > 0 ? '↑ High' : anomaly.zScore < 0 ? '↓ Low' : '⚠ Unusual',
                                 unit: '',
-                                color: anomaly.zScore > 0 ? const Color(0xFFE53E3E) : const Color(0xFF2563EB),
+                                color: anomaly.zScore > 0 ? kRed : anomaly.zScore < 0 ? const Color(0xFF2563EB) : Colors.grey,
                               ),
                             ),
                             const SizedBox(width: 12),
@@ -278,7 +302,7 @@ class AnomalyDetailScreen extends StatelessWidget {
                                 value:
                                     (anomaly.confidence * 100).toStringAsFixed(0),
                                 unit: '%',
-                                color: _navy,
+                                color: kNavy,
                               ),
                             ),
                           ],
@@ -310,6 +334,48 @@ class AnomalyDetailScreen extends StatelessWidget {
                     ),
                   ),
 
+                  const SizedBox(height: 8),
+
+                  // ── Statistical context — prevents user panic ───────────────
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade50,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.blue.shade100),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(children: [
+                          Icon(Icons.bar_chart_outlined, size: 14, color: Colors.blue.shade700),
+                          const SizedBox(width: 6),
+                          Text(
+                            'STATISTICAL CONTEXT',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.blue.shade700,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ]),
+                        const SizedBox(height: 8),
+                        Text(
+                          'This reading is ${anomaly.zScore.abs().toStringAsFixed(1)}σ (standard deviations) ${anomaly.zScore > 0 ? "above" : "below"} YOUR personal baseline — not a population average or clinical threshold.',
+                          style: TextStyle(fontSize: 12, color: Colors.blue.shade800, height: 1.5),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Severity reflects statistical deviation:\n'
+                          '  Mild: 3.0–4.5σ   Moderate: 4.5–6.5σ   Severe: ≥ 6.5σ\n\n'
+                          'A "Severe" reading means this value is very unusual for YOU specifically. It does not necessarily indicate a medical emergency.',
+                          style: TextStyle(fontSize: 11, color: Colors.blue.shade600, height: 1.5),
+                        ),
+                      ],
+                    ),
+                  ),
+
                   const SizedBox(height: 12),
 
                   // ── Explanation ────────────────────────────────────────────
@@ -324,7 +390,7 @@ class AnomalyDetailScreen extends StatelessWidget {
                             anomaly.explanation,
                             style: const TextStyle(
                               fontSize: 13,
-                              color: _navy,
+                              color: kNavy,
                               fontWeight: FontWeight.w500,
                               height: 1.5,
                             ),
@@ -414,28 +480,18 @@ class AnomalyDetailScreen extends StatelessWidget {
   }
 
   String _severityDescription(String severity, double z) {
-    final direction = z > 0 ? 'above' : 'below';
+    final direction = z > 0 ? 'above' : z < 0 ? 'below' : 'outside';
+    final zAbs = z.abs().toStringAsFixed(1);
     return switch (severity) {
-      'severe' => 'Severe — this reading is well $direction your personal baseline '
-          'and warrants close attention.',
-      'moderate' => 'Moderate — this reading is notably $direction your typical range.',
-      _ => 'Mild — this reading is slightly $direction your personal baseline. '
-          'Monitor over the next few hours.',
+      'severe' => 'Severe — this reading is $zAbs\u03c3 $direction your personal baseline. '
+          'Unusual for you, but review the context below before taking action.',
+      'moderate' => 'Moderate — this reading is $zAbs\u03c3 $direction your typical range. '
+          'Worth monitoring over the next 24 hours.',
+      _ => 'Mild — this reading is $zAbs\u03c3 $direction your personal baseline. '
+          'A small deviation — likely normal variation.',
     };
   }
 
-  IconData _metricIcon(String metricType) {
-    return switch (metricType) {
-      'HR_INSTANT' || 'RHR_DAILY' => Icons.favorite,
-      'HRV_SDNN' || 'HRV_RMSSD' => Icons.monitor_heart,
-      'SPO2_INSTANT' => Icons.water_drop,
-      'STEPS_DELTA' => Icons.directions_walk,
-      'ENERGY_DELTA' || 'ENERGY_BASAL' => Icons.local_fire_department,
-      'RESP_RATE' => Icons.air,
-      'VO2_MAX' => Icons.bolt,
-      _ => Icons.show_chart,
-    };
-  }
 }
 
 // ── Severity Gauge ────────────────────────────────────────────────────────────
@@ -456,32 +512,28 @@ class _SeverityGauge extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Stack(
-          clipBehavior: Clip.none,
-          children: [
-            // Gradient bar
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: Container(
-                height: 12,
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      Color(0xFF38A169),
-                      Color(0xFFD97706),
-                      Color(0xFFE53E3E),
-                    ],
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final left = (markerPos * constraints.maxWidth - 2).clamp(0.0, constraints.maxWidth - 4);
+            return Stack(
+              clipBehavior: Clip.none,
+              children: [
+                // Gradient bar
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    height: 12,
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [kGreen, kAmber, kRed],
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
-            // Marker
-            Positioned(
-              left: null,
-              child: FractionallySizedBox(
-                widthFactor: markerPos,
-                child: Align(
-                  alignment: Alignment.centerRight,
+                // Marker
+                Positioned(
+                  left: left,
+                  top: -4,
                   child: Container(
                     width: 4,
                     height: 20,
@@ -494,9 +546,9 @@ class _SeverityGauge extends StatelessWidget {
                     ),
                   ),
                 ),
-              ),
-            ),
-          ],
+              ],
+            );
+          },
         ),
         const SizedBox(height: 6),
         Row(
@@ -516,9 +568,9 @@ class _SeverityGauge extends StatelessWidget {
 // ── Severity Badge ─────────────────────────────────────────────────────────────
 
 class _SeverityBadge extends StatelessWidget {
-  final String severity;
+  final String label;
   final Color color;
-  const _SeverityBadge({required this.severity, required this.color});
+  const _SeverityBadge({required this.label, required this.color});
 
   @override
   Widget build(BuildContext context) {
@@ -530,7 +582,7 @@ class _SeverityBadge extends StatelessWidget {
         border: Border.all(color: color.withValues(alpha: 0.25)),
       ),
       child: Text(
-        severity[0].toUpperCase() + severity.substring(1),
+        label,
         style: TextStyle(
           fontSize: 11,
           fontWeight: FontWeight.w700,

@@ -1,3 +1,6 @@
+import 'package:flutter/material.dart';
+import '../theme/colors.dart';
+
 /// Data model for a detected health anomaly from GET /anomalies
 class AnomalyItem {
   final String id;
@@ -26,18 +29,21 @@ class AnomalyItem {
         id: j['id']?.toString() ?? '',
         metricType: j['metric_type'] as String? ?? '',
         value: (j['value'] as num?)?.toDouble() ?? 0.0,
+        // Use epoch as fallback so bad/missing timestamps never appear in the
+        // "Today" filter (epoch is 1970 — always in the past).
         eventTimestamp: j['event_timestamp'] != null
-            ? DateTime.tryParse(j['event_timestamp'] as String) ?? DateTime.now()
-            : DateTime.now(),
+            ? (DateTime.tryParse(j['event_timestamp'] as String) ?? DateTime.utc(1970)).toLocal()
+            : DateTime.utc(1970).toLocal(),
         zScore: (j['z_score'] as num?)?.toDouble() ?? 0.0,
         severity: j['severity'] as String? ?? 'mild',
         confidence: (j['confidence'] as num?)?.toDouble() ?? 0.0,
         explanation: j['explanation'] as String? ?? '',
         detectedAt: j['detected_at'] != null
-            ? DateTime.tryParse(j['detected_at'] as String) ?? DateTime.now()
-            : DateTime.now(),
+            ? (DateTime.tryParse(j['detected_at'] as String) ?? DateTime.utc(1970)).toLocal()
+            : DateTime.utc(1970).toLocal(),
       );
 
+  // v3.0 metric labels — 14 supported types
   String get metricLabel => switch (metricType) {
         'HR_INSTANT' => 'Heart Rate',
         'HRV_SDNN' => 'HRV (SDNN)',
@@ -45,9 +51,14 @@ class AnomalyItem {
         'SPO2_INSTANT' => 'Blood Oxygen',
         'RHR_DAILY' => 'Resting HR',
         'STEPS_DELTA' => 'Steps',
-        'ENERGY_DELTA' => 'Active Energy',
         'RESP_RATE' => 'Respiratory Rate',
         'VO2_MAX' => 'VO₂ Max',
+        'BP_SYSTOLIC' => 'BP (Systolic)',
+        'BP_DIASTOLIC' => 'BP (Diastolic)',
+        'SLEEP_APNEA_EVENT' => 'Sleep Apnea',
+        'AFIB_FLAG' => 'AFib Detection',
+        'EXERCISE_TIME' => 'Exercise Time',
+        'SLEEP_STAGE' => 'Sleep',
         _ => metricType,
       };
 
@@ -56,9 +67,36 @@ class AnomalyItem {
         'HRV_SDNN' || 'HRV_RMSSD' => 'ms',
         'SPO2_INSTANT' => '%',
         'STEPS_DELTA' => 'steps',
-        'ENERGY_DELTA' => 'kcal',
         'RESP_RATE' => 'br/min',
         'VO2_MAX' => 'mL/kg/min',
+        'BP_SYSTOLIC' || 'BP_DIASTOLIC' => 'mmHg',
+        'SLEEP_APNEA_EVENT' => 'events',
+        'AFIB_FLAG' => '',
+        'EXERCISE_TIME' || 'SLEEP_STAGE' => 'min',
         _ => '',
+      };
+
+  Color get severityColor => switch (severity) {
+        'severe' => kRed,
+        'moderate' => kOrange,
+        _ => kAmber,
+      };
+
+  String get severityDisplay =>
+      severity.isEmpty ? 'Unknown' : severity[0].toUpperCase() + severity.substring(1);
+
+  IconData get metricIcon => switch (metricType) {
+        'HR_INSTANT' || 'RHR_DAILY' => Icons.favorite,
+        'HRV_SDNN' || 'HRV_RMSSD' => Icons.monitor_heart,
+        'SPO2_INSTANT' => Icons.water_drop,
+        'STEPS_DELTA' => Icons.directions_walk,
+        'RESP_RATE' => Icons.air,
+        'VO2_MAX' => Icons.bolt,
+        'BP_SYSTOLIC' || 'BP_DIASTOLIC' => Icons.speed,
+        'SLEEP_APNEA_EVENT' => Icons.bedtime,
+        'AFIB_FLAG' => Icons.warning_amber,
+        'EXERCISE_TIME' => Icons.fitness_center,
+        'SLEEP_STAGE' => Icons.bedtime,
+        _ => Icons.show_chart,
       };
 }

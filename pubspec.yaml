@@ -1,7 +1,7 @@
 name: lifepulse_test_app
 description: "TikCare LifePulse – device connection test app (iOS / HealthKit)"
 publish_to: 'none'
-version: 1.0.0+7
+version: 1.0.0+10
 
 environment:
   sdk: ^3.6.1
