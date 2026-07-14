@@ -33,6 +33,13 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^5.0.0
 
+# device_info_plus 12.4.0 added an isiOSAppOnVision reference that only
+# compiles against the iOS 26.1 SDK (Xcode 26+), breaking builds on older
+# Xcode even though the call itself is @available-guarded at runtime.
+# Pin below 12.4.0 until this is fixed upstream.
+dependency_overrides:
+  device_info_plus: ^12.3.0
+
 flutter:
   uses-material-design: true
   assets:

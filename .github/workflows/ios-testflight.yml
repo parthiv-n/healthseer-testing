@@ -1,0 +1,51 @@
+name: iOS TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_signing:
+        description: "One-time only: create the signing certificate. Leave unchecked for normal builds."
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+      APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.6"
+          channel: "stable"
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      - name: Bootstrap signing (one-time)
+        if: ${{ inputs.bootstrap_signing }}
+        working-directory: ios
+        run: bundle exec fastlane ios bootstrap_signing
+
+      - name: Build and upload to TestFlight
+        if: ${{ !inputs.bootstrap_signing }}
+        working-directory: ios
+        run: bundle exec fastlane ios beta

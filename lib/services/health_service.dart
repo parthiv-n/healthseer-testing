@@ -14,7 +14,7 @@ import '../models/anomaly_item.dart';
 import '../models/trend_point.dart';
 
 // ── Default API config (demo / TestFlight) ───────────────────────────────────
-const kDefaultApiUrl = 'https://lifepulse-api-63410932899.us-central1.run.app';
+const kDefaultApiUrl = 'https://vitametric-api-63410932899.us-central1.run.app';
 const kTenantSlug = 'tikcare';
 
 /// Connection mode: OW = full chain via Open Wearables (unavailable — SDK removed);

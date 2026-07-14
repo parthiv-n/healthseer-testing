@@ -1,0 +1,8 @@
+app_identifier("com.tikcare.lifepulseTestApp")
+team_id("ZU36HR24VA")
+
+# If uploads to App Store Connect ever fail with a team-mismatch error,
+# set itc_team_id to the numeric team ID shown in App Store Connect ->
+# Users and Access -> your name -> the team switcher (it can differ
+# from the Apple Developer team_id above for accounts on multiple teams).
+# itc_team_id("1234567")
