@@ -10,7 +10,7 @@ workflows:
     environment:
       ios_signing:
         distribution_type: app_store
-        bundle_identifier: com.thesilverx.tikcare.selfie
+        bundle_identifier: com.tikcare.lifepulseTestApp
       vars:
         APP_STORE_APPLE_ID: 6760596177
         BUNDLE_ID: "com.tikcare.lifepulseTestApp"
