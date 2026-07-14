@@ -1,5 +1,19 @@
-import 'package:flutter/material.dart';
+import 'dart:ui';
 import '../theme/colors.dart';
+
+class Icons {
+  static const IconData favorite = IconData(0xe87d, fontFamily: 'MaterialIcons');
+  static const IconData monitor_heart = IconData(0xf0fc, fontFamily: 'MaterialIcons');
+  static const IconData water_drop = IconData(0xe73e, fontFamily: 'MaterialIcons');
+  static const IconData directions_walk = IconData(0xe531, fontFamily: 'MaterialIcons');
+  static const IconData air = IconData(0xe50a, fontFamily: 'MaterialIcons');
+  static const IconData bolt = IconData(0xe0e7, fontFamily: 'MaterialIcons');
+  static const IconData speed = IconData(0xe52d, fontFamily: 'MaterialIcons');
+  static const IconData bedtime = IconData(0xe1bd, fontFamily: 'MaterialIcons');
+  static const IconData warning_amber = IconData(0xe002, fontFamily: 'MaterialIcons');
+  static const IconData fitness_center = IconData(0xeb43, fontFamily: 'MaterialIcons');
+  static const IconData show_chart = IconData(0xe24f, fontFamily: 'MaterialIcons');
+}
 
 /// Data model for a detected health anomaly from GET /anomalies
 class AnomalyItem {
