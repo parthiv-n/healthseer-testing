@@ -130,7 +130,7 @@ class _SplashScreenState extends State<SplashScreen>
 
                       // App name
                       const Text(
-                        'TikCare LifePulse',
+                        'Vitametric',
                         style: TextStyle(
                           color: Colors.white,
                           fontSize: 28,
@@ -143,7 +143,7 @@ class _SplashScreenState extends State<SplashScreen>
 
                       // Tagline
                       Text(
-                        'Your health, intelligently understood.',
+                        'Health insights from your wearable.',
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.75),
                           fontSize: 14,
@@ -168,7 +168,7 @@ class _SplashScreenState extends State<SplashScreen>
 
                       // Footer
                       Text(
-                        'Powered by TikCare AI',
+                        'Powered by TikCare',
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.4),
                           fontSize: 11,

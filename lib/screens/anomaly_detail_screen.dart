@@ -1,37 +1,33 @@
 import 'package:flutter/material.dart';
 import '../models/anomaly_item.dart';
+import '../utils/metric_display.dart';
 import '../theme/colors.dart';
 
 // ── Lookup tables ─────────────────────────────────────────────────────────────
 
-const _metricDisplayNames = {
-  'HR_INSTANT': 'Heart Rate',
-  'HRV_SDNN': 'Heart Rate Variability',
-  'HRV_RMSSD': 'Heart Rate Variability',
-  'SPO2_INSTANT': 'Blood Oxygen',
-  'STEPS_DELTA': 'Step Count',
-  'RHR_DAILY': 'Resting Heart Rate',
-  'RESP_RATE': 'Respiratory Rate',
-  'ENERGY_DELTA': 'Active Energy',
-  'VO2_MAX': 'VO\u2082 Max',
-  'DISTANCE_DELTA': 'Distance',
-  'FLOORS_CLIMBED': 'Floors Climbed',
-  'EXERCISE_TIME': 'Exercise Time',
-  'ENERGY_BASAL': 'Basal Energy',
-  'SLEEP_STAGE': 'Sleep',
-};
+// _metricDisplayNames was a local map duplicating MetricDisplay.label(); it
+// kept four removed v3.0 metrics (ENERGY_DELTA, DISTANCE_DELTA,
+// FLOORS_CLIMBED, ENERGY_BASAL) and was missing AFIB_FLAG, BP_*, and
+// SLEEP_APNEA_EVENT. Now delegates to the single source of truth so adding a
+// metric type only requires editing lib/utils/metric_display.dart.
 
+// Explanation copy uses the neutral phrase "your typical range" instead of
+// "your typical range" so it's accurate for both source types: when the
+// anomaly was scored against the user's own \u226514-day baseline AND when it
+// was scored against the cold-start population reference. The detail screen
+// renders an explicit source banner that distinguishes the two cases \u2014
+// see _BaselineSourceBanner below.
 const _anomalyExplanations = {
   'HR_INSTANT':
-      'Your heart rate was significantly above or below your personal baseline. '
+      'Your heart rate was significantly above or below your typical range. '
       'This can occur during exercise, stress, illness, or high caffeine intake. '
       'Occasional spikes are normal, but persistent patterns may warrant attention.',
   'HRV_SDNN':
-      'Your heart rate variability dropped below your personal baseline. '
+      'Your heart rate variability dropped below your typical range. '
       'Low HRV can indicate fatigue, stress, illness, or insufficient recovery. '
       'HRV naturally varies day to day, so a single reading is not cause for alarm.',
   'HRV_RMSSD':
-      'Your heart rate variability was outside your personal baseline range. '
+      'Your heart rate variability was outside your typical range. '
       'HRV reflects how well your nervous system is adapting to daily demands. '
       'Trends over multiple days are more meaningful than a single reading.',
   'SPO2_INSTANT':
@@ -40,88 +36,89 @@ const _anomalyExplanations = {
       'Repositioning your device and re-measuring may resolve a single low reading.',
   'STEPS_DELTA':
       'Your step count was significantly different from your typical daily pattern. '
-      'This may reflect an unusually active or sedentary day, travel, or illness. '
-      'TikCare compares this against your personal rolling average.',
+      'This may reflect an unusually active or sedentary day, travel, or illness.',
   'RHR_DAILY':
-      'Your resting heart rate deviated from your personal baseline. '
+      'Your resting heart rate deviated from your typical range. '
       'A temporarily elevated resting HR can indicate stress, dehydration, or the '
       'early stages of illness. A lower-than-usual reading may follow intense training.',
   'RESP_RATE':
       'Your respiratory rate was outside your normal range. '
       'Changes in breathing rate can be associated with respiratory illness, sleep quality, '
       'or changes in physical fitness. Consult a doctor if it persists.',
-  'ENERGY_DELTA':
-      'Your active energy output was significantly different from your baseline. '
-      'This may reflect a very active or very sedentary day, or changes in your activity.',
   'VO2_MAX':
-      'Your estimated VO\u2082 Max changed from your personal baseline. '
+      'Your estimated VO\u2082 Max changed from your typical level. '
       'VO\u2082 Max reflects cardiovascular fitness and changes slowly over weeks to months.',
-  'DISTANCE_DELTA':
-      'Your total distance traveled was significantly different from your typical day. '
-      'This may reflect an unusually active or sedentary day, travel, illness, or a change in routine. '
-      'TikCare compares this against your personal rolling average.',
-  'FLOORS_CLIMBED':
-      'The number of floors you climbed was significantly different from your typical pattern. '
-      'This may reflect a change in environment, routine, or physical capability. '
-      'A single unusual day is generally not a concern.',
   'EXERCISE_TIME':
-      'Your recorded exercise duration was significantly different from your baseline. '
+      'Your recorded exercise duration was significantly different from your typical range. '
       'A notable drop may reflect illness, fatigue, or schedule changes. '
       'An unusually high reading may indicate an intense training day or data from a new activity type.',
-  'ENERGY_BASAL':
-      'Your basal metabolic energy output shifted from your baseline. '
-      'Basal energy reflects the calories your body burns at rest, which can vary with sleep quality, '
-      'body temperature, and overall health status.',
   'SLEEP_STAGE':
-      'Your sleep duration or quality was significantly different from your personal baseline. '
+      'Your sleep duration or quality was significantly different from your typical range. '
       'Sleep anomalies can reflect disrupted rest, illness, travel across time zones, or irregular bedtimes.',
+  'AFIB_FLAG':
+      'Atrial fibrillation was detected by your Apple Watch. AFib is associated '
+      'with about a 5\u00d7 increase in stroke risk and warrants follow-up with a clinician '
+      'even if you feel well. A single notification is not a diagnosis \u2014 your doctor '
+      'will likely want to review the underlying ECG.',
+  'BP_SYSTOLIC':
+      'Your systolic (top) blood pressure was outside your typical range. '
+      'Sustained values above 130 mmHg are linked to increased cardiovascular risk; '
+      'a single high reading can also follow exercise, stress, or caffeine.',
+  'BP_DIASTOLIC':
+      'Your diastolic (bottom) blood pressure was outside your typical range. '
+      'A persistently elevated diastolic reading is one of the strongest signals for '
+      'starting blood-pressure conversations with a clinician.',
+  'SLEEP_APNEA_EVENT':
+      'Your watch flagged unusual breathing disturbances during sleep. Sleep apnea '
+      'is a common but under-diagnosed condition that affects daytime energy and '
+      'long-term cardiovascular health. A clinician can confirm via a take-home study.',
 };
 
 const _anomalyGuidance = {
   'HR_INSTANT_mild':
-      'Monitor over the next few hours. Avoid stimulants like caffeine. Stay hydrated.',
+      'Take it easy and stay hydrated. Often passes by tomorrow.',
   'HR_INSTANT_moderate':
-      'Rest and stay hydrated. Avoid strenuous activity. If it persists for several hours, consult a doctor.',
+      'Rest and stay hydrated. Take it slower today; if it lingers a few days, mention it at your next visit.',
   'HR_INSTANT_severe':
-      'Seek medical attention if you feel unwell, dizzy, or have chest discomfort. Contact your doctor promptly.',
+      'Take a moment to rest. If you feel unwell or off, a quick chat with your doctor at your next visit can put your mind at ease.',
   'HRV_SDNN_mild':
       'Prioritize rest and sleep tonight. Reduce stress where possible.',
   'HRV_SDNN_moderate':
       'Take a recovery day — light activity only. Ensure 7-9 hours of sleep. Monitor tomorrow.',
   'HRV_SDNN_severe':
-      'Focus on full rest. If accompanied by symptoms like illness or chest tightness, see a doctor.',
+      'Make rest the priority today. If you feel unwell more broadly, worth flagging at your next visit.',
   'HRV_RMSSD_mild': 'Prioritize rest and sleep tonight. Reduce stress where possible.',
   'HRV_RMSSD_moderate':
       'Take a recovery day — light activity only. Ensure 7-9 hours of sleep.',
   'HRV_RMSSD_severe':
-      'Focus on full rest. If accompanied by illness or chest tightness, see a doctor.',
+      'Make rest the priority today. If you feel unwell more broadly, worth flagging at your next visit.',
   'SPO2_INSTANT_mild':
       'Re-measure with your device properly positioned. Ensure your fingers are warm.',
   'SPO2_INSTANT_moderate':
-      'Re-measure several times. If readings remain low, reduce physical exertion and consult a doctor.',
+      'Retake a few times. If readings stay low, take it slower today and mention it at your next visit.',
   'SPO2_INSTANT_severe':
-      'Seek medical attention, especially if accompanied by shortness of breath or dizziness.',
+      'If you feel short of breath and aren’t at altitude, worth bringing up at your next check-in.',
   'STEPS_DELTA_mild': 'No action required — a single unusual day is normal.',
   'STEPS_DELTA_moderate': 'Check in on your activity levels. If sedentary due to illness, rest as needed.',
   'STEPS_DELTA_severe': 'Significant deviation — verify data is accurate and monitor your wellbeing.',
   'RHR_DAILY_mild':
       'Ensure adequate hydration and sleep. Check in tomorrow.',
   'RHR_DAILY_moderate':
-      'Rest well tonight. If elevated for 2+ days, consider consulting a doctor.',
+      'Rest well tonight. If it stays elevated for a few days, mention it at your next visit.',
   'RHR_DAILY_severe':
-      'Persistently elevated resting HR warrants a doctor visit, especially with symptoms.',
+      'A few days at this level are worth flagging at your next check-in, especially if you have been feeling off.',
   'RESP_RATE_mild':
       'No immediate action needed. Monitor over the next day.',
   'RESP_RATE_moderate':
-      'If you have other symptoms (cough, fever), see a doctor. Otherwise monitor closely.',
+      'If you have a cough or feel unwell, mention it at your next visit. Otherwise just keep an eye on it.',
   'RESP_RATE_severe':
-      'Seek medical attention, especially if breathing feels labored or you feel unwell.',
+      'If your breathing feels off or you are unwell more broadly, worth bringing up at your next check-in.',
   'ENERGY_DELTA_mild': 'Normal variation — no action needed.',
   'ENERGY_DELTA_moderate': 'Assess whether this reflects illness or intentional rest.',
   'ENERGY_DELTA_severe': 'Significant deviation — confirm you are feeling well.',
   'VO2_MAX_mild': 'Normal variation. VO\u2082 Max changes slowly over weeks.',
   'VO2_MAX_moderate': 'Monitor trend over the next few weeks.',
-  'VO2_MAX_severe': 'Consult a doctor if a large drop accompanies other symptoms.',
+  'VO2_MAX_severe': 'A larger drop is worth mentioning at your next check-in if you have also been feeling off.',
   'DISTANCE_DELTA_mild': 'Normal variation — a single unusual day requires no action.',
   'DISTANCE_DELTA_moderate': 'Check whether you are feeling well. If sedentary due to illness, rest as needed.',
   'DISTANCE_DELTA_severe': 'Significant deviation from your routine — confirm you are feeling well and that data is accurate.',
@@ -133,10 +130,10 @@ const _anomalyGuidance = {
   'EXERCISE_TIME_severe': 'A large change in exercise time — check you are feeling well and that all activity was recorded correctly.',
   'ENERGY_BASAL_mild': 'Normal day-to-day variation — no action needed.',
   'ENERGY_BASAL_moderate': 'Ensure you are well-rested and healthy. Unusual basal energy can accompany illness.',
-  'ENERGY_BASAL_severe': 'Persistent changes in basal energy may warrant a check-in with your doctor.',
+  'ENERGY_BASAL_severe': 'If a pattern persists, worth flagging at your next check-in.',
   'SLEEP_STAGE_mild': 'An occasional off night is normal. Aim for consistent sleep times.',
   'SLEEP_STAGE_moderate': 'Try to prioritize 7–9 hours of sleep. Avoid screens before bed and keep a regular schedule.',
-  'SLEEP_STAGE_severe': 'Severely disrupted sleep can affect your overall health. If this persists, consult a doctor.',
+  'SLEEP_STAGE_severe': 'A few rough nights in a row are worth raising with a doctor at your next check-in.',
 };
 
 // ── Screen ────────────────────────────────────────────────────────────────────
@@ -147,17 +144,20 @@ class AnomalyDetailScreen extends StatelessWidget {
 
   Color get _severityColor => anomaly.severityColor;
 
-  String get _displayName =>
-      _metricDisplayNames[anomaly.metricType] ?? anomaly.metricLabel;
+  String get _displayName {
+    final fromUtility = MetricDisplay.label(anomaly.metricType);
+    if (fromUtility.isNotEmpty) return fromUtility;
+    return anomaly.metricLabel;
+  }
 
   String get _explanation =>
       _anomalyExplanations[anomaly.metricType] ??
-      'An anomaly was detected for this metric based on your personal baseline.';
+      'An anomaly was detected for this metric based on your typical range.';
 
   String get _guidance {
     final key = '${anomaly.metricType}_${anomaly.severity}';
     return _anomalyGuidance[key] ??
-        'Monitor this metric over the next 24 hours. If you feel unwell, consult your doctor.';
+        'Keep an eye on this over the next day or two. If you feel off more broadly, worth flagging at your next check-in.';
   }
 
   @override
@@ -337,44 +337,12 @@ class AnomalyDetailScreen extends StatelessWidget {
                   const SizedBox(height: 8),
 
                   // ── Statistical context — prevents user panic ───────────────
-                  Container(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: Colors.blue.shade50,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.blue.shade100),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(children: [
-                          Icon(Icons.bar_chart_outlined, size: 14, color: Colors.blue.shade700),
-                          const SizedBox(width: 6),
-                          Text(
-                            'STATISTICAL CONTEXT',
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.blue.shade700,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                        ]),
-                        const SizedBox(height: 8),
-                        Text(
-                          'This reading is ${anomaly.zScore.abs().toStringAsFixed(1)}σ (standard deviations) ${anomaly.zScore > 0 ? "above" : "below"} YOUR personal baseline — not a population average or clinical threshold.',
-                          style: TextStyle(fontSize: 12, color: Colors.blue.shade800, height: 1.5),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          'Severity reflects statistical deviation:\n'
-                          '  Mild: 3.0–4.5σ   Moderate: 4.5–6.5σ   Severe: ≥ 6.5σ\n\n'
-                          'A "Severe" reading means this value is very unusual for YOU specifically. It does not necessarily indicate a medical emergency.',
-                          style: TextStyle(fontSize: 11, color: Colors.blue.shade600, height: 1.5),
-                        ),
-                      ],
-                    ),
-                  ),
+                  // The phrasing changes with baseline source: "personal" rows
+                  // can honestly say "vs YOUR baseline"; "community" rows must
+                  // say "vs population reference" until the user crosses the
+                  // 14-day threshold. Conflating the two is the same labelling
+                  // bug that made the portal "Your Usual" column misleading.
+                  _StatisticalContextCard(anomaly: anomaly),
 
                   const SizedBox(height: 12),
 
@@ -483,15 +451,135 @@ class AnomalyDetailScreen extends StatelessWidget {
     final direction = z > 0 ? 'above' : z < 0 ? 'below' : 'outside';
     final zAbs = z.abs().toStringAsFixed(1);
     return switch (severity) {
-      'severe' => 'Severe — this reading is $zAbs\u03c3 $direction your personal baseline. '
+      'severe' => 'Severe — this reading is $zAbs\u03c3 $direction your typical range. '
           'Unusual for you, but review the context below before taking action.',
       'moderate' => 'Moderate — this reading is $zAbs\u03c3 $direction your typical range. '
           'Worth monitoring over the next 24 hours.',
-      _ => 'Mild — this reading is $zAbs\u03c3 $direction your personal baseline. '
+      _ => 'Mild — this reading is $zAbs\u03c3 $direction your typical range. '
           'A small deviation — likely normal variation.',
     };
   }
 
+}
+
+// ── Statistical Context Card ─────────────────────────────────────────────────
+//
+// Renders different copy depending on whether this anomaly was scored against
+// the user's PERSONAL baseline (≥14 days of their own data), a COMMUNITY
+// reference (ACC/AHA / WHO / NHANES — for cold-start), or no baseline at all
+// (a hard-coded clinical safe-range gate, e.g. SpO2 < 90).
+class _StatisticalContextCard extends StatelessWidget {
+  final AnomalyItem anomaly;
+  const _StatisticalContextCard({required this.anomaly});
+
+  @override
+  Widget build(BuildContext context) {
+    final zAbs = anomaly.zScore.abs().toStringAsFixed(1);
+    final dir = anomaly.zScore > 0 ? 'above' : 'below';
+    final source = anomaly.baselineSource;
+
+    // Lead sentence + footnote vary by source.
+    final String leadCopy;
+    final String footnoteCopy;
+    if (source == 'personal') {
+      final n = anomaly.baselineSampleCount ?? 0;
+      leadCopy = 'This reading is ${zAbs}σ $dir YOUR personal baseline '
+          '(built from $n of your own samples) — not a population average '
+          'or clinical threshold.';
+      footnoteCopy = 'Severity reflects statistical deviation:\n'
+          '  ${AnomalyThresholds.rangeText()}\n\n'
+          'A "Severe" reading means this value is very unusual for YOU specifically. '
+          'It does not necessarily indicate a medical emergency.';
+    } else if (source == 'community') {
+      leadCopy = 'This reading is ${zAbs}σ $dir a population reference '
+          '(ACC/AHA / WHO / NHANES) used while we build your personal '
+          'baseline — you have ${anomaly.baselineSampleCount ?? 0} samples '
+          'so far, ≥14 days needed for a personal comparison.';
+      footnoteCopy = 'Severity reflects statistical deviation against the '
+          'reference population — once you have ≥14 days of data, severity '
+          'will recalibrate against YOUR own typical range. '
+          'A "Severe" reading here means this value is unusual for the '
+          'reference cohort and worth monitoring.';
+    } else {
+      // No baseline — hard-coded clinical gate (e.g. SpO2 < 90, AFib detected).
+      leadCopy = 'This reading triggered a clinical safe-range alert — '
+          'it crossed a fixed medical threshold rather than a statistical baseline.';
+      footnoteCopy = 'Severity reflects how far the reading is outside the '
+          'safe-range gate, which is set from medical guidelines and does '
+          'not depend on personal history. Consult a clinician if you feel '
+          'unwell.';
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.blue.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.blue.shade100),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.bar_chart_outlined, size: 14, color: Colors.blue.shade700),
+            const SizedBox(width: 6),
+            Text(
+              'STATISTICAL CONTEXT',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: Colors.blue.shade700,
+                letterSpacing: 0.5,
+              ),
+            ),
+            // Source chip — at-a-glance honesty about which comparator was used.
+            const SizedBox(width: 6),
+            _SourceChip(source: source),
+          ]),
+          const SizedBox(height: 8),
+          Text(
+            leadCopy,
+            style: TextStyle(fontSize: 12, color: Colors.blue.shade800, height: 1.5),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            footnoteCopy,
+            style: TextStyle(fontSize: 11, color: Colors.blue.shade600, height: 1.5),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SourceChip extends StatelessWidget {
+  final String? source;
+  const _SourceChip({required this.source});
+
+  @override
+  Widget build(BuildContext context) {
+    final (label, fg, bg) = switch (source) {
+      'personal'  => ('PERSONAL',     const Color(0xFF1E40AF), const Color(0xFFDBEAFE)),
+      'community' => ('REFERENCE',    const Color(0xFF92400E), const Color(0xFFFEF3C7)),
+      _           => ('CLINICAL GATE',const Color(0xFF991B1B), const Color(0xFFFEE2E2)),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 9,
+          fontWeight: FontWeight.w800,
+          color: fg,
+          letterSpacing: 0.4,
+        ),
+      ),
+    );
+  }
 }
 
 // ── Severity Gauge ────────────────────────────────────────────────────────────

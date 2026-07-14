@@ -4,10 +4,17 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/health_service.dart';
+import '../services/sync_state.dart';
+import '../services/sync_telemetry.dart';
 import '../models/health_snapshot.dart';
 import '../models/risk_insight.dart';
 import '../utils/time_utils.dart';
+import '../utils/metric_display.dart';
+import '../utils/historical_gap_filler.dart';
+import '../widgets/historical_gap_banner.dart';
 import '../theme/colors.dart';
+import '../theme/typography.dart';
+import 'widgets/unified_metric_tile.dart';
 
 class HomeScreen extends StatefulWidget {
   final SharedPreferences prefs;
@@ -26,12 +33,29 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   HealthSnapshot? _snapshot;
   bool _loadingSnapshot = true;
 
+  // ── Historical-gap detection (matches Trends screen behaviour) ───────────
+  // localDays = days with data in Apple Health for the recent window;
+  // analyzedDays = days the backend has actually processed. When local >
+  // analyzed by ≥3 days we render the tappable gap banner, and silently
+  // auto-trigger a chunked re-sync (throttled to once per 12h).
+  int? _localGapDays;
+  bool _gapResyncing = false;
+
   // ── Cloud insights ───────────────────────────────────────────────────────
   RiskInsight? _insight;
   bool _loadingInsight = false;
   // True after all retry attempts are exhausted with no result.
   // Distinguishes a real fetch failure from a normal cold-start wait.
   bool _insightFetchFailed = false;
+
+  // ── Round-18 — per-metric baselines (drives UnifiedMetricTile) ─────────
+  // Replaces the round-17 phase-2 SignalsPanel state (dropped DailyReport
+  // since the unified section now reads `currentValue` straight from the
+  // HealthSnapshot, not the server-side daily report). Kept in parallel
+  // with the sync + insight fetches; tiles render a per-metric "no
+  // baseline yet" affordance when this map is empty.
+  Map<String, double> _baselineByMetric = const {};
+  bool _signalsLoading = true;
 
   // ── Last sync summary (persisted) ────────────────────────────────────────
   String? _lastSyncTime;
@@ -90,7 +114,26 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _checkApi();
     _loadLocalSnapshot();
     _detectDevice();
+    _loadSignals();
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  /// Round-18: load per-metric 90-day baselines used by UnifiedMetricTile.
+  /// Independent of sync: if the fetch fails, individual tiles render a
+  /// "No baseline yet" affordance and the rest of Today still works.
+  Future<void> _loadSignals({bool silent = false}) async {
+    if (!silent) setState(() => _signalsLoading = true);
+    try {
+      final baselines = await HealthService.fetchBaselines();
+      if (!mounted) return;
+      setState(() {
+        _baselineByMetric = baselines;
+        _signalsLoading = false;
+      });
+    } catch (e) {
+      debugPrint('[HomeScreen._loadSignals] $e');
+      if (mounted) setState(() => _signalsLoading = false);
+    }
   }
 
   @override
@@ -128,29 +171,66 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // Skip if manual sync is already running.
     if (_syncing) return;
 
-    final prefs = await SharedPreferences.getInstance();
-    final lastSuccess = prefs.getBool('last_sync_success') ?? false;
-    final lastTime = prefs.getString('last_sync_time');
-    // Only auto-sync if last sync was successful or has never happened.
-    if (!lastSuccess && lastTime != null) return;
+    // Track B: SyncStateStore is the source of truth.  The previous
+    // implementation read four legacy SharedPrefs keys that the v5.0
+    // migration deletes — the throttle would then think the user had
+    // never synced and silently fire on every resume forever.
+    await SyncStateStore.instance.load();
+    final state = SyncStateStore.instance.value;
+    final lastSuccess = state.lastSuccessAtIso != null;
+    final lastErrName = state.lastErrorClass;
+    final lastErr = lastErrName != null
+        ? SyncErrorType.values.where((e) => e.name == lastErrName).firstOrNull
+        : null;
+    final lastAttempt = state.lastAttemptAtIso != null
+        ? DateTime.tryParse(state.lastAttemptAtIso!)
+        : null;
 
-    // Use last_sync_iso (wall-clock time of last sync) to throttle resume syncs
-    // to once per 30 minutes. last_sync_anchor is the health-event timestamp, not
-    // the sync time — using it causes the throttle to fire based on data age, not
-    // elapsed time since sync.
-    final lastSyncIso = prefs.getString('last_sync_iso');
-    if (lastSyncIso != null) {
-      final last = DateTime.tryParse(lastSyncIso);
-      if (last != null && DateTime.now().difference(last).inMinutes < 30) return;
+    // Resume policy:
+    //   * never synced (no attempt recorded) → let the first-sync banner
+    //     drive — don't auto-fire
+    //   * last attempt succeeded → throttle to once per 30 min
+    //   * last attempt was a transient failure (network / unknown /
+    //     serverError) → auto-retry on resume so a flaky-Wi-Fi tap
+    //     doesn't leave the user stuck on a stale tile.  Throttle to
+    //     once per 5 min so we don't hammer a backend that's actually
+    //     down.
+    //   * permission / auth errors → user must act (open Health app,
+    //     sign in) — auto-retry would just bounce off the same wall.
+    const transient = {
+      SyncErrorType.network,
+      SyncErrorType.serverError,
+      SyncErrorType.unknown,
+    };
+    final isTransientFailure =
+        state.lastAttemptFailed && transient.contains(lastErr);
+    // Brand-new install / no attempt yet — let the onboarding banner
+    // drive the first sync.
+    if (lastAttempt == null) return;
+    // Last attempt failed for a non-transient reason — don't auto-retry.
+    if (state.lastAttemptFailed && !isTransientFailure) return;
+
+    // Throttle: 30 min for normal cadence, 5 min for transient-failure retry.
+    final throttleMin = isTransientFailure ? 5 : 30;
+    final last = lastSuccess
+        ? DateTime.tryParse(state.lastSuccessAtIso!)
+        : lastAttempt;
+    if (last != null &&
+        DateTime.now().difference(last).inMinutes < throttleMin) {
+      return;
     }
 
     // Capture the current devices list before the async gap so the .then()
     // closure doesn't reference the instance field after potential disposal.
     final knownDevices = List<String>.from(_lastSyncDevices);
 
-    // Silent sync — no spinner, no UI disruption.
+    // Silent sync — no spinner, no UI disruption.  Tag this as
+    // "background" so the portal's failure-rate dashboard doesn't
+    // attribute auto-resume failures to manual user-initiated taps.
     try {
-      final result = await HealthService.syncDirect();
+      final result = await HealthService.syncDirect(
+        syncPath: SyncPath.background,
+      );
       if (!mounted) return;
       if (result.success) {
         final eventCount = (result.data?['events_received'] as int?) ?? 0;
@@ -160,7 +240,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             : (result.data?['source_devices'] as List?)?.cast<String>() ?? [];
         await _saveLastSync(true, eventCount, null, devices);
         if (mounted) {
-          _loadLocalSnapshot();
+          _loadLocalSnapshot(silent: true);
           _loadCachedInsight();
         }
       } else {
@@ -181,9 +261,117 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  Future<void> _loadLocalSnapshot() async {
-    setState(() => _loadingSnapshot = true);
-    final snapshot = await HealthService.fetchTodaySnapshot();
+  // Recompute the Apple-Health-vs-analyzed gap and trigger an auto re-sync
+  // when warranted. Call this whenever ``_insight`` changes (cache load,
+  // retry success, manual sync) so the banner reflects current state.
+  Future<void> _recomputeHistoricalGap() async {
+    final insight = _insight;
+    if (insight == null) return;
+    // Fetch local Apple Health day-count over the same 30-day window the
+    // insight is summarising. fetchLocalDaysWithData is HKHealth-only and
+    // returns 0 on Android — banner stays hidden by the `> 0` check below.
+    final local = await HealthService.fetchLocalDaysWithData(days: 30);
+    if (!mounted) return;
+    final gap = local - insight.daysWithData;
+    setState(() => _localGapDays = gap > 0 ? gap : null);
+    if (gap > 0) {
+      final fut = await HistoricalGapFiller.maybeAutoFill(gap);
+      if (fut != null && mounted) {
+        setState(() => _gapResyncing = true);
+        // Subscribe to completion — same fix as the Trends screen. The
+        // previous code set _gapResyncing=true with no follow-up to
+        // clear it, so the "Filling the gap…" banner would render
+        // forever after one auto-trigger.
+        // ignore: unawaited_futures
+        fut.then((result) async {
+          if (!mounted) return;
+          if (result.success) {
+            await HistoricalGapFiller.markComplete();
+          }
+          setState(() {
+            _gapResyncing = false;
+            // Re-evaluate gap after the backfill — the banner should
+            // shrink or disappear entirely.
+            _localGapDays = null;
+          });
+          // Refresh the underlying snapshot + insight so the user sees
+          // the freshly-backfilled days reflected in the tiles.
+          if (result.success) {
+            _loadLocalSnapshot(silent: true);
+            _fetchInsightsWithRetry();
+          }
+        });
+        // Defensive 3-minute cap.
+        Future.delayed(const Duration(minutes: 3), () {
+          if (mounted && _gapResyncing) {
+            setState(() => _gapResyncing = false);
+          }
+        });
+      }
+    }
+  }
+
+  Future<void> _runManualGapResync(int gapDays) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Fill historical gap?', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+        content: Text(
+          'Re-uploads up to ${HealthService.kHistoricalSyncDays} days from Apple Health to backfill the '
+          '$gapDays missing days. Runs in weekly chunks — safe to interrupt; '
+          'duplicates are filtered automatically.',
+          style: const TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Re-sync', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _gapResyncing = true);
+    final result = await HealthService.syncDirect(
+      forceFullResync: true,
+      syncPath: SyncPath.historical,
+    );
+    if (result.success) await HistoricalGapFiller.markComplete();
+    if (!mounted) return;
+    setState(() => _gapResyncing = false);
+    messenger.showSnackBar(SnackBar(
+      content: Text(result.success
+          ? 'Re-sync complete. Data is updating…'
+          : 'Re-sync failed: ${result.message}'),
+      backgroundColor: result.success ? Colors.green : Colors.red,
+    ));
+    if (result.success) {
+      _loadLocalSnapshot();
+      _recomputeHistoricalGap();
+    }
+  }
+
+  Future<void> _loadLocalSnapshot({bool silent = false}) async {
+    // silent = true: background refresh — don't flash loading spinner,
+    // just update the data when ready.
+    if (!silent) setState(() => _loadingSnapshot = true);
+    var snapshot = await HealthService.fetchTodaySnapshot();
+    // Round-17 phase 2: when the FIRST snapshot read after app cold-start
+    // returns nothing (no data + no devices), wait 1s and retry once.
+    // iOS HealthKit can take a beat to "warm up" right after app launch
+    // — the Apple Watch needs to wake, sources need to be queried.  A
+    // single retry handles the init-race without blocking the UI.
+    if (snapshot.primarySource == null && !snapshot.hasData && mounted) {
+      await Future.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      final retry = await HealthService.fetchTodaySnapshot();
+      if (retry.hasData || retry.primarySource != null) {
+        snapshot = retry;
+      }
+    }
     if (mounted) setState(() { _snapshot = snapshot; _loadingSnapshot = false; });
   }
 
@@ -206,19 +394,56 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _loadLastSync() async {
-    final prefs = await SharedPreferences.getInstance();
-    final errorName = prefs.getString('last_sync_error_type');
-    final errorType = errorName != null
-        ? SyncErrorType.values.where((e) => e.name == errorName).firstOrNull
+    // Track B: SyncStateStore is the source of truth for sync timestamps
+    // and outcomes.  Pre-fix this method read five legacy SharedPrefs
+    // keys (last_sync_iso, last_sync_time, last_event_count,
+    // last_sync_success, last_sync_error_type) — but migrate() deletes
+    // them on app start.  Result: every upgraded user saw "never
+    // synced" on the home screen even though their sync history was
+    // intact in syncstate_v1_*.  This was the same UX failure mode
+    // Track B was designed to eliminate.  Now migrated.
+    await SyncStateStore.instance.load();
+    final state = SyncStateStore.instance.value;
+
+    final errorType = state.lastErrorClass != null
+        ? SyncErrorType.values
+            .where((e) => e.name == state.lastErrorClass)
+            .firstOrNull
         : null;
+
+    // Devices list and new-device flag remain in SharedPreferences for
+    // now (not part of SyncState); these were never deleted by
+    // migrate() and the existing UX depends on them.
+    final prefs = await SharedPreferences.getInstance();
     final rawDevices = prefs.getStringList('last_sync_devices') ?? [];
     final newDevice = prefs.getBool('new_device_detected') ?? false;
-    final rawIso = prefs.getString('last_sync_iso');
+
+    DateTime? successAt;
+    String? successLabel;
+    if (state.lastSuccessAtIso != null) {
+      successAt = DateTime.tryParse(state.lastSuccessAtIso!);
+      if (successAt != null) {
+        // Render the same "M/D HH:MM" label format the legacy code used
+        // so downstream widget consumers don't need to change.
+        final m = successAt.month;
+        final d = successAt.day;
+        final hh = successAt.hour.toString().padLeft(2, '0');
+        final mm = successAt.minute.toString().padLeft(2, '0');
+        successLabel = '$m/$d $hh:$mm';
+      }
+    }
+
     setState(() {
-      _lastSyncTime = prefs.getString('last_sync_time');
-      _lastSyncAt = rawIso != null ? DateTime.tryParse(rawIso) : null;
-      _lastEventCount = prefs.getInt('last_event_count');
-      _lastSyncSuccess = prefs.getBool('last_sync_success');
+      _lastSyncTime = successLabel;
+      _lastSyncAt = successAt;
+      _lastEventCount = state.lastEventCount;
+      // _lastSyncSuccess reflects the LATEST attempt's outcome, not
+      // whether a success has ever happened.  state.lastAttemptFailed
+      // is true iff the last attempt failed; invert for "succeeded".
+      // null when no attempt has ever happened.
+      _lastSyncSuccess = state.lastAttemptAtIso == null
+          ? null
+          : !state.lastAttemptFailed;
       _lastSyncErrorType = errorType;
       _lastSyncDevices = rawDevices;
       _newDeviceDetected = newDevice;
@@ -242,9 +467,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         previousDevices.isNotEmpty &&
         devices.any((d) => !previousDevices.contains(d));
 
-    await prefs.setString('last_sync_time', label);
-    await prefs.setString('last_sync_iso', now.toIso8601String());
-    await prefs.setInt('last_event_count', eventCount);
+    // CRITICAL (Track B fix for v4.5 outage UX):
+    //   `last_sync_time` and `last_sync_iso` represent "when was the most
+    //   recent SUCCESSFUL sync".  Pre-fix the code wrote them on every
+    //   attempt — success or failure — so the Profile top row read
+    //   "Last synced now" while the expanded body said "Last sync failed
+    //   now".  Only update on success.
+    if (success) {
+      await prefs.setString('last_sync_time', label);
+      await prefs.setString('last_sync_iso', now.toIso8601String());
+      await prefs.setInt('last_event_count', eventCount);
+    }
     await prefs.setBool('last_sync_success', success);
     await prefs.setStringList('last_sync_devices', devices);
     await prefs.setBool('new_device_detected', newDeviceFound);
@@ -258,9 +491,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // throws on a deactivated widget.
     if (!mounted) return;
     setState(() {
-      _lastSyncTime = label;
-      _lastSyncAt = now;
-      _lastEventCount = eventCount;
+      if (success) {
+        _lastSyncTime = label;
+        _lastSyncAt = now;
+        _lastEventCount = eventCount;
+      }
       _lastSyncSuccess = success;
       _lastSyncErrorType = errorType;
       _lastSyncDevices = devices;
@@ -269,7 +504,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _checkApi() async {
-    final result = await HealthService.pingLifePulse();
+    final result = await HealthService.pingVitametric();
     if (mounted) {
       setState(() => _apiOnline = result.success);
     }
@@ -285,6 +520,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _pulseCtrl.repeat(reverse: true);
 
     try {
+      // Round-17 phase 2: hard 3-minute timeout on the WHOLE sync flow.
+      // Round-7 already added per-step polling timeouts (90s incremental,
+      // 3min historical) inside HealthService.syncDirect, but if any
+      // upstream stage hangs (HK read stuck, JWT refresh hung, native
+      // VO2 bridge wedged) the spinner could in principle stay on
+      // forever.  This outer ceiling guarantees the user always gets a
+      // result — success OR a clear failure — within 3 minutes.
       final result = await HealthService.syncDirect(
         onLog: (msg) {
           // Surface upload batch progress to the UI
@@ -292,6 +534,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             setState(() => _syncStatusMsg = msg);
           }
         },
+      ).timeout(
+        const Duration(minutes: 3),
+        onTimeout: () => SyncResult(
+          success: false,
+          message: 'Sync took too long (>3 min). Please try again.',
+          errorType: SyncErrorType.unknown,
+        ),
       );
 
       final eventCount = (result.data?['events_received'] as int?) ?? 0;
@@ -321,6 +570,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           // released immediately — _fetchInsightsWithRetry() manages its
           // own loading state and runs independently of _syncing.
           _fetchInsightsWithRetry();
+          // Round-17 phase 2: refresh the SignalsPanel data after a
+          // successful sync so the per-metric tiles reflect today's
+          // values, not the pre-sync cached report.
+          _loadSignals(silent: true);
         }
       }
     } catch (e) {
@@ -348,12 +601,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   /// the HRI card shows a stable "Fetching insights…" spinner rather than
   /// flickering between spinner and "waiting" message between retries.
   ///
-  /// Retry schedule: 3 s → 10 s → 20 s (33 s total, each attempt has its
-  /// own 30 s HTTP timeout, worst-case ~63 s before giving up).
+  /// Retry schedule: 5 s → 10 s → 15 s → 20 s → 25 s (75 s total).
+  /// The backend processes events asynchronously (202 Accepted), so the
+  /// first fetch often arrives before baselines are computed. We keep
+  /// retrying if the result looks stale (cold_start with 0 days despite
+  /// a successful upload).
   Future<void> _fetchInsightsWithRetry() async {
     if (!mounted) return;
     setState(() => _loadingInsight = true);
-    const retryDelays = [3, 10, 20];
+    const retryDelays = [5, 10, 15, 20, 25];
+    RiskInsight? lastInsight;
     try {
       for (final delaySec in retryDelays) {
         await Future.delayed(Duration(seconds: delaySec));
@@ -361,17 +618,43 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         final insight = await HealthService.fetchRiskInsight();
         if (!mounted) return;
         if (insight != null) {
-          setState(() {
-            _insight = insight;
-            _apiOnline = true;
-            _insightFetchFailed = false;
-          });
-          return; // success — stop
+          lastInsight = insight;
+          // Backend returns 200 even while still processing. If baselines
+          // haven't been computed yet the response looks like cold_start with
+          // 0 days — keep retrying so the user sees the real score.
+          final looksReady = insight.hriScore > 0 ||
+              insight.daysWithData > 0 ||
+              insight.baselineMaturity != 'cold_start';
+          if (looksReady) {
+            setState(() {
+              _insight = insight;
+              _apiOnline = true;
+              _insightFetchFailed = false;
+            });
+            // Surface gap banner if Apple Health has more days than the
+            // backend has analyzed; auto-trigger re-sync (throttled).
+            _recomputeHistoricalGap();
+            return; // success — stop
+          }
         }
       }
-      // All attempts exhausted — mark as failed so the UI can distinguish
-      // this state from a normal first-sync wait.
-      if (mounted) setState(() => _insightFetchFailed = true);
+      // Retries exhausted — show whatever we got (may still be cold_start
+      // if the backend genuinely has no data yet, which is fine).
+      if (lastInsight != null) {
+        setState(() {
+          _insight = lastInsight;
+          _apiOnline = true;
+          _insightFetchFailed = false;
+        });
+        return;
+      }
+      // All attempts exhausted. Only mark as failed if we have NO insight
+      // at all (neither from retries nor from a previous cache load).
+      // If _insight already holds cached data, keep showing it rather than
+      // replacing it with a "Could not load" error.
+      if (mounted && _insight == null) {
+        setState(() => _insightFetchFailed = true);
+      }
       HealthService.reportClientError(
         'hri_fetch_failed',
         context: 'all retries exhausted',
@@ -379,7 +662,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       );
     } catch (e) {
       debugPrint('[HomeScreen._fetchInsightsWithRetry] $e');
-      if (mounted) setState(() => _insightFetchFailed = true);
+      if (mounted && _insight == null) {
+        setState(() => _insightFetchFailed = true);
+      }
       HealthService.reportClientError(
         'hri_fetch_exception',
         context: e.runtimeType.toString(),
@@ -390,16 +675,38 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  // Keys must match `_WhatWeSyncChips._metrics[i].$3`. A metric is "active"
+  // when the latest snapshot has a non-null value for it — i.e. data was
+  // ingested. Drives blue (active) vs grey (no data) chip rendering.
+  Set<String> _activeMetricsFromSnapshot() {
+    final s = _snapshot;
+    if (s == null) return const <String>{};
+    return <String>{
+      if (s.latestHr != null) 'hr',
+      if (s.hrv != null) 'hrv',
+      if (s.steps != null) 'steps',
+      if (s.spo2 != null) 'spo2',
+      if (s.rhr != null) 'rhr',
+      if (s.exerciseMin != null) 'exercise',
+      if (s.sleepHours != null) 'sleep',
+      if (s.respRate != null) 'resp',
+    };
+  }
+
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    // iPhone-only flag: has steps/sleep data but no HR/HRV (no Apple Watch).
+    // iPhone-only flag: nothing from a Watch in the last 7 days, but iPhone
+    // is still recording steps/sleep. The previous test ("no HR in last 24h")
+    // mis-fired any time a user took the watch off overnight to charge — the
+    // banner accused them of having no Watch when in fact they wore one
+    // yesterday. `noHrLast7Days` is computed in fetchTodaySnapshot() and only
+    // turns true when there's truly no HR sample in the past week.
     final isIphoneOnly = !_loadingSnapshot &&
         _lastSyncTime != null &&
         _snapshot != null &&
-        _snapshot!.avgHr == null &&
-        _snapshot!.hrv == null &&
+        _snapshot!.noHrLast7Days &&
         (_snapshot!.steps != null || _snapshot!.sleepHours != null);
 
     return Scaffold(
@@ -413,32 +720,49 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // ── First-time / new-device welcome banner ───────────────
-                  if (_lastSyncTime == null && !_syncing) ...[
-                    _FirstSyncBanner(
-                      onSync: _runSync,
-                      isReturningUser: _isReturningUser,
+                  // Round-11: removed the _FirstSyncBanner ("Connect Now" /
+                  // "Reconnect") top card.  The bottom "Sync Now" button is
+                  // visible from the same screen and the banner duplicated
+                  // its purpose — and worse, the gating condition
+                  // (_lastSyncTime == null) lingered on every failed first
+                  // sync, surfacing two competing call-to-action buttons.
+
+                  // ── Historical-gap banner (when Apple Health > analyzed) ──
+                  if (_localGapDays != null && _localGapDays! > 0) ...[
+                    HistoricalGapBanner(
+                      gapDays: _localGapDays!,
+                      resyncing: _gapResyncing,
+                      onTap: () => _runManualGapResync(_localGapDays!),
                     ),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 12),
                   ],
 
                   // ── Section 1: Your Health Today ──────────────────────────
+                  // Round-18: single unified per-metric section. Each tile
+                  // shows the latest HK reading + sample age + comparison
+                  // against the member's personal 90-day baseline (delta% +
+                  // status pill: Normal / Above usual / Below usual).
+                  // Replaces the pre-round-18 split between _HealthTodayGrid
+                  // (HK current values) and SignalsPanel (baseline comparison)
+                  // — the duplicate sections both rendered the same metrics
+                  // and operators reported it as "cluttered, redundant".
                   _SectionHeader(title: 'Your Health Today', icon: Icons.favorite_border),
-                  const SizedBox(height: 8),
-                  _HealthTodayGrid(
+                  const SizedBox(height: AppSpacing.sm),
+                  _UnifiedHealthSection(
                     snapshot: _snapshot,
-                    loading: _loadingSnapshot,
+                    snapshotLoading: _loadingSnapshot,
+                    signalsLoading: _signalsLoading,
+                    baselines: _baselineByMetric,
                     hasSynced: _lastSyncTime != null,
                     deviceBrand: _deviceBrand,
-                    onRefresh: _loadLocalSnapshot,
                   ),
                   // iPhone-only notice: has steps/sleep but no HR/HRV
                   if (isIphoneOnly) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: AppSpacing.sm),
                     _IphoneOnlyBanner(),
                   ],
 
-                  const SizedBox(height: 20),
+                  const SizedBox(height: AppSpacing.xl),
 
                   // ── Section 2: Risk Insights (cloud) ─────────────────────
                   _SectionHeader(
@@ -446,18 +770,25 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     icon: Icons.shield_outlined,
                     subtitle: 'from TikCare',
                   ),
-                  const SizedBox(height: 8),
-                  // Cache banner
-                  if (_insightFromCache && _insightCachedAt != null) ...[
-                    _CacheBanner(
-                      cachedAt: _insightCachedAt!,
-                      onTap: _runSync,
-                    ),
+                  const SizedBox(height: AppSpacing.sm),
+                  // Cache banner — suppressed while a historical-gap
+                  // backfill is in flight. The gap banner already says
+                  // "Backfilling N days …" so showing a second "Showing
+                  // cached data from yesterday" line at the same time
+                  // was redundant and read as a panic stack to the user.
+                  if (_insightFromCache && _insightCachedAt != null && !_gapResyncing) ...[
+                    _CacheBanner(cachedAt: _insightCachedAt!),
                     const SizedBox(height: 8),
                   ],
                   // Error banner — always show permission errors; others only when no cached data
-                  if (!_syncing && _lastSyncErrorType != null &&
-                      (_insight == null || _lastSyncErrorType == SyncErrorType.permissionDenied)) ...[
+                  // Error banner — show whenever sync truly failed, regardless of
+                  // whether we have a cached insight. Hiding the banner when cache
+                  // existed left users with a mute Retry button and no clue why
+                  // sync was failing (most often: token cleared by 401 refresh).
+                  if (!_syncing &&
+                      _lastSyncSuccess == false &&
+                      _lastSyncErrorType != null &&
+                      _lastSyncErrorType != SyncErrorType.noData) ...[
                     _ErrorBanner(
                       errorType: _lastSyncErrorType!,
                       onSignIn: () => Navigator.pushNamedAndRemoveUntil(
@@ -477,7 +808,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     onRetry: _fetchInsightsWithRetry,
                   ),
 
-                  const SizedBox(height: 20),
+                  const SizedBox(height: AppSpacing.xl),
 
                   // ── Section 3: Sync (compact — expandable details) ─────────
                   _CompactSyncSection(
@@ -492,8 +823,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     lastSyncDevices: _lastSyncDevices,
                     lastSyncAt: _lastSyncAt,
                     newDeviceDetected: _newDeviceDetected,
+                    activeMetrics: _activeMetricsFromSnapshot(),
                     onSync: _runSync,
-                    onCheckApi: _checkApi,
                     onDismissNewDevice: () async {
                       final prefs = await SharedPreferences.getInstance();
                       await prefs.setBool('new_device_detected', false);
@@ -545,10 +876,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'TikCare LifePulse',
+                        'TikCare Vitametric',
                         style: TextStyle(
                           color: Colors.white,
-                          fontSize: 20,
+                          fontSize: 18,
                           fontWeight: FontWeight.w700,
                           letterSpacing: -0.3,
                         ),
@@ -591,45 +922,70 @@ class _SectionHeader extends StatelessWidget {
       children: [
         Icon(icon, size: 16, color: kNavy),
         const SizedBox(width: 6),
-        Text(
-          title,
-          style: const TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.w600,
-            color: kTextPrimary,
-            letterSpacing: -0.2,
-          ),
-        ),
+        Text(title, style: AppText.sectionHeader),
         if (subtitle != null) ...[
           const SizedBox(width: 4),
-          Text(
-            subtitle!,
-            style: const TextStyle(fontSize: 12, color: kTextSecondary),
-          ),
+          Text(subtitle!, style: AppText.caption),
         ],
       ],
     );
   }
 }
 
-// ── Health Today Grid ─────────────────────────────────────────────────────────
-
-class _HealthTodayGrid extends StatelessWidget {
+// ── Unified Health Section ────────────────────────────────────────────────────
+//
+// Round-18: replaces both the pre-round-18 ``_HealthTodayGrid`` (HK current
+// values in a 2-col grid) and the ``SignalsPanel`` (baseline comparison
+// list) which used to live as two separate sections with the same metrics.
+// Operators reported the duplication as cluttered and confusing.
+//
+// Each metric now renders as one full-width ``UnifiedMetricTile``:
+//   ┌──────────────────────────────────────────────────┐
+//   │ ❤  Heart Rate                            72.3 bpm │
+//   │                                          (2h ago) │
+//   │     Your usual: 70.1 bpm     +3.2%       [Normal] │
+//   └──────────────────────────────────────────────────┘
+//
+// Sleep keeps its dedicated breakdown card (full-width, multi-stage). AFib
+// is inline only when ``afibDetected == true`` because a binary "None" tile
+// for every member who's never had an episode adds no value.
+class _UnifiedHealthSection extends StatelessWidget {
   final HealthSnapshot? snapshot;
-  final bool loading;
+  final bool snapshotLoading;
+  final bool signalsLoading;
+  final Map<String, double> baselines;
   final bool hasSynced;
   final String? deviceBrand;
-  final VoidCallback onRefresh;
-  const _HealthTodayGrid({this.snapshot, required this.loading, required this.hasSynced, this.deviceBrand, required this.onRefresh});
+
+  const _UnifiedHealthSection({
+    required this.snapshot,
+    required this.snapshotLoading,
+    required this.signalsLoading,
+    required this.baselines,
+    required this.hasSynced,
+    this.deviceBrand,
+  });
+
+  // Convert a HealthSnapshot field (display-form) back to backend stored-form
+  // for routing through MetricDisplay.formatWithUnit. SpO2 is the only metric
+  // whose Flutter snapshot pre-multiplies (×100 for %); everything else round
+  // -trips 1:1.
+  double? _toStored(String metricType, num? snapshotValue) {
+    if (snapshotValue == null) return null;
+    final scale = MetricDisplay.scale(metricType);
+    if (scale == 1.0) return snapshotValue.toDouble();
+    return snapshotValue.toDouble() / scale;
+  }
 
   @override
   Widget build(BuildContext context) {
-    if (loading) {
+    if (snapshotLoading) {
       return _Card(
         child: const Center(
           child: Padding(
             padding: EdgeInsets.all(16),
-            child: Text('Reading HealthKit…', style: TextStyle(color: Colors.grey, fontSize: 13)),
+            child: Text('Reading HealthKit…',
+                style: TextStyle(color: Colors.grey, fontSize: 13)),
           ),
         ),
       );
@@ -639,20 +995,17 @@ class _HealthTodayGrid extends StatelessWidget {
     if (s == null || !s.hasData) {
       final msg = hasSynced
           ? 'No health readings found today.\nMake sure your device is worn and synced.'
-          : 'Tap "Sync" below to pull in your health data.';
+          : 'Tap "Sync Now" below to pull in your health data.';
       return _Card(
         child: Padding(
           padding: const EdgeInsets.all(4),
           child: Row(
             children: [
-              Icon(hasSynced ? Icons.watch_outlined : Icons.sync, size: 16, color: Colors.grey),
+              Icon(hasSynced ? Icons.watch_outlined : Icons.sync,
+                  size: 16, color: Colors.grey),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(msg, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-              ),
-              GestureDetector(
-                onTap: onRefresh,
-                child: const Icon(Icons.refresh, size: 18, color: Colors.grey),
+                child: Text(msg, style: AppText.caption),
               ),
             ],
           ),
@@ -660,142 +1013,263 @@ class _HealthTodayGrid extends StatelessWidget {
       );
     }
 
-    // Show all supported metrics. Tiles with no data display '—' plus a device
-    // hint so users understand what hardware is needed to unlock each metric.
-    String h(String metric) => HealthService.metricHint(metric, deviceBrand);
-    final tiles = <_MetricTileData>[
-      _MetricTileData('Avg HR',     s.avgHr != null ? '${s.avgHr!.toInt()} bpm' : '—',                      Icons.favorite,               Colors.red.shade400,    deviceHint: h('hr')),
-      _MetricTileData('Steps',      s.steps != null ? _formatSteps(s.steps!) : '—',                          Icons.directions_walk,         kNavy),
-      _MetricTileData('Sleep',      s.sleepHours != null ? '${s.sleepHours!.toStringAsFixed(1)}h' : '—',     Icons.bedtime_outlined,        Colors.indigo.shade400, deviceHint: h('sleep')),
-      _MetricTileData('HRV',        s.hrv != null ? '${s.hrv!.toInt()} ms' : '—',                            Icons.monitor_heart_outlined,  Colors.blue.shade400,   deviceHint: h('hrv')),
-      _MetricTileData('Resting HR', s.rhr != null ? '${s.rhr!.toInt()} bpm' : '—',                           Icons.favorite_border,         Colors.pink.shade300,   deviceHint: h('rhr')),
-      _MetricTileData('Blood O₂',   s.spo2 != null ? '${s.spo2!.toStringAsFixed(1)}%' : '—',                Icons.water_drop_outlined,     Colors.cyan.shade600,   deviceHint: h('spo2')),
-      _MetricTileData('Exercise',   s.exerciseMin != null ? '${s.exerciseMin} min' : '—',                    Icons.fitness_center,          Colors.green.shade600,  deviceHint: h('exercise')),
-      _MetricTileData('Resp Rate',  s.respRate != null ? '${s.respRate!.toStringAsFixed(1)} br/m' : '—',     Icons.air,                     Colors.teal.shade500,   deviceHint: h('resp')),
-      _MetricTileData('BP Sys',     s.bpSystolic != null ? '${s.bpSystolic!.toInt()} mmHg' : '—',           Icons.compress,                Colors.orange.shade400, deviceHint: h('bp')),
-      _MetricTileData('BP Dia',     s.bpDiastolic != null ? '${s.bpDiastolic!.toInt()} mmHg' : '—',         Icons.compress,                Colors.orange.shade300, deviceHint: h('bp')),
-      _MetricTileData('AFib',       s.afibDetected == null ? '—' : (s.afibDetected! ? 'Detected' : 'None'),  Icons.electrical_services,    s.afibDetected == true ? Colors.red.shade600 : Colors.green.shade600, deviceHint: h('afib')),
+    // Order matches the most-glanced-at metrics first: HR + Steps top, then
+    // recovery (HRV / RHR / SpO2), then activity (Exercise), then breath +
+    // BP. Sleep card is inserted between the cardiac and recovery rows.
+    final specs = <_UnifiedSpec>[
+      _UnifiedSpec('HR_INSTANT',    _toStored('HR_INSTANT', s.latestHr),
+          s.hrSampleAt,         Icons.favorite,                Colors.red.shade400),
+      _UnifiedSpec('STEPS_DELTA',   _toStored('STEPS_DELTA', s.steps),
+          null,                 Icons.directions_walk,         kNavy),
+      _UnifiedSpec('HRV_SDNN',      _toStored('HRV_SDNN', s.hrv),
+          s.hrvSampleAt,        Icons.monitor_heart_outlined,  Colors.blue.shade400),
+      _UnifiedSpec('RHR_DAILY',     _toStored('RHR_DAILY', s.rhr),
+          s.rhrSampleAt,        Icons.favorite_border,         Colors.pink.shade300),
+      _UnifiedSpec('SPO2_INSTANT',  _toStored('SPO2_INSTANT', s.spo2),
+          s.spo2SampleAt,       Icons.water_drop_outlined,     Colors.cyan.shade600),
+      _UnifiedSpec('EXERCISE_TIME', _toStored('EXERCISE_TIME', s.exerciseMin),
+          null,                 Icons.fitness_center,          Colors.green.shade600),
+      _UnifiedSpec('RESP_RATE',     _toStored('RESP_RATE', s.respRate),
+          s.respRateSampleAt,   Icons.air,                     Colors.teal.shade500),
+      _UnifiedSpec('BP_SYSTOLIC',   _toStored('BP_SYSTOLIC', s.bpSystolic),
+          s.bpSampleAt,         Icons.compress,                Colors.orange.shade400),
+      _UnifiedSpec('BP_DIASTOLIC',  _toStored('BP_DIASTOLIC', s.bpDiastolic),
+          s.bpSampleAt,         Icons.compress,                Colors.orange.shade300),
     ];
 
-    // Pair tiles into rows of 2.
-    final rows = <Widget>[];
-    for (int i = 0; i < tiles.length; i += 2) {
-      if (rows.isNotEmpty) rows.add(const SizedBox(height: 8));
-      rows.add(Row(children: [
-        Expanded(child: _MetricTile(label: tiles[i].label, value: tiles[i].value, icon: tiles[i].icon, iconColor: tiles[i].color, deviceHint: tiles[i].deviceHint)),
-        const SizedBox(width: 8),
-        if (i + 1 < tiles.length)
-          Expanded(child: _MetricTile(label: tiles[i+1].label, value: tiles[i+1].value, icon: tiles[i+1].icon, iconColor: tiles[i+1].color, deviceHint: tiles[i+1].deviceHint))
-        else
-          const Expanded(child: SizedBox()),
-      ]));
+    final children = <Widget>[];
+    for (var i = 0; i < specs.length; i++) {
+      if (i > 0) children.add(const SizedBox(height: AppSpacing.sm));
+      final spec = specs[i];
+      children.add(UnifiedMetricTile(
+        metricType: spec.metricType,
+        currentValue: spec.value,
+        sampleAt: spec.sampleAt,
+        baselineMedian: baselines[spec.metricType],
+        iconOverride: spec.icon,
+        iconColor: spec.color,
+      ));
+      // Slot the Sleep breakdown card right after Steps so the "what did
+      // you do today + how did you sleep" recap reads as one block.
+      if (spec.metricType == 'STEPS_DELTA') {
+        children.add(const SizedBox(height: AppSpacing.sm));
+        children.add(_SleepBreakdownCard(
+          snapshot: s,
+          hint: HealthService.metricHint('sleep', deviceBrand),
+        ));
+      }
     }
 
-    return _Card(
-      padding: const EdgeInsets.all(12),
-      child: Column(
+    // AFib only when actually detected — a perpetual "None" tile adds no
+    // information for the 99.x% of members who never have an episode.
+    if (s.afibDetected == true) {
+      children.add(const SizedBox(height: AppSpacing.sm));
+      children.add(_AfibAlertTile(sampleAt: s.afibSampleAt));
+    }
+
+    // Source + baseline disclaimer. Single line, low-contrast — gives users
+    // a one-glance reminder of where the numbers come from without cluttering
+    // every tile.
+    children.add(const SizedBox(height: AppSpacing.md));
+    children.add(Padding(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          ...rows,
-          const SizedBox(height: 6),
-          Row(
-            children: [
-              const Icon(Icons.watch_outlined, size: 12, color: kTextSecondary),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  s.primarySource != null ? 'Via ${s.primarySource}' : 'Live from HealthKit',
-                  style: const TextStyle(fontSize: 10, color: kTextSecondary),
-                  overflow: TextOverflow.ellipsis,
+          const Icon(Icons.watch_outlined, size: 12, color: kTextSecondary),
+          const SizedBox(width: AppSpacing.xs),
+          Expanded(
+            child: Text(
+              s.primarySource != null
+                  ? 'Via ${s.primarySource} · compared against your 90-day usual'
+                  : 'Live from HealthKit · compared against your 90-day usual',
+              style: AppText.caption.copyWith(color: kTextSecondary),
+            ),
+          ),
+        ],
+      ),
+    ));
+
+    return Column(children: children);
+  }
+}
+
+class _UnifiedSpec {
+  final String metricType;
+  final double? value;
+  final DateTime? sampleAt;
+  final IconData icon;
+  final Color color;
+  const _UnifiedSpec(
+      this.metricType, this.value, this.sampleAt, this.icon, this.color);
+}
+
+/// Inline AFib detection banner — only shown when AFib is currently flagged.
+/// Apple Watch's AFib detection has 96% sensitivity and detected events
+/// indicate ~5× higher stroke risk per Framingham, so a dedicated red
+/// banner with a short call-to-action ("share with your doctor") is the
+/// right surface — not buried in a tile grid.
+class _AfibAlertTile extends StatelessWidget {
+  final DateTime? sampleAt;
+  const _AfibAlertTile({this.sampleAt});
+
+  @override
+  Widget build(BuildContext context) {
+    final ageText = sampleAt != null ? relativeTime(sampleAt!) : null;
+    return Container(
+      padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.lg, vertical: AppSpacing.md),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFEF2F2),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFFECACA)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.electrical_services, size: 20, color: Colors.red.shade600),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('AFib detected',
+                    style: AppText.tileTitle.copyWith(
+                        color: Colors.red.shade700)),
+                Text(
+                  ageText != null
+                      ? 'Reported $ageText. Consider sharing with your doctor.'
+                      : 'Recently reported. Consider sharing with your doctor.',
+                  style: AppText.caption.copyWith(color: Colors.red.shade700),
                 ),
-              ),
-              GestureDetector(
-                onTap: onRefresh,
-                child: const Icon(Icons.refresh, size: 14, color: kTextSecondary),
-              ),
-            ],
+              ],
+            ),
           ),
         ],
       ),
     );
   }
-
-  String _formatSteps(int steps) {
-    if (steps >= 1000) return '${(steps / 1000).toStringAsFixed(1)}k';
-    return '$steps';
-  }
 }
 
-class _MetricTileData {
-  final String label;
-  final String value;
-  final IconData icon;
-  final Color color;
-  /// Shown as a small hint when value is '—', e.g. "Needs Apple Watch S6+".
-  final String? deviceHint;
-  const _MetricTileData(this.label, this.value, this.icon, this.color, {this.deviceHint});
-}
+// _MetricTile + MetricTileData were moved to widgets/metric_tile.dart
+// in v4.4. Renamed to MetricTile / MetricTileData (public) so other screens
+// can reuse them.
 
-class _MetricTile extends StatelessWidget {
-  final String label;
-  final String value;
-  final IconData icon;
-  final Color iconColor;
-  final String? deviceHint;
-  const _MetricTile({required this.label, required this.value, required this.icon, this.iconColor = kNavy, this.deviceHint});
-
-  bool get _hasData => value != '—';
+/// Full-width sleep card with a breakdown by stage. Replaces the single Sleep
+/// tile so users see how the night was actually spent (Deep / REM / Light)
+/// instead of one opaque "X.Yh" total. AWAKE intervals are intentionally not
+/// shown — the pipeline filters them server-side and Apple Health does not
+/// reliably distinguish "awake during sleep" from "awake after final wake".
+class _SleepBreakdownCard extends StatelessWidget {
+  final HealthSnapshot snapshot;
+  final String? hint;
+  const _SleepBreakdownCard({required this.snapshot, this.hint});
 
   @override
   Widget build(BuildContext context) {
+    final s = snapshot;
+    final hasTotal = s.sleepHours != null;
+    final hasStages = s.sleepDeepMin != null || s.sleepRemMin != null || s.sleepLightMin != null;
+
+    String fmtHrs(int? min) {
+      if (min == null || min == 0) return '—';
+      final h = min ~/ 60;
+      final m = min % 60;
+      if (h == 0) return '${m}m';
+      if (m == 0) return '${h}h';
+      return '${h}h ${m}m';
+    }
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: _hasData ? kMetricBg : const Color(0xFFF7F7F7),
+        color: hasTotal ? kMetricBg : const Color(0xFFF7F7F7),
         borderRadius: BorderRadius.circular(12),
-        border: _hasData ? null : Border.all(color: const Color(0xFFE8E8E8), width: 1),
+        border: hasTotal ? null : Border.all(color: const Color(0xFFE8E8E8), width: 1),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 26,
-              fontWeight: FontWeight.w700,
-              color: _hasData ? kTextPrimary : const Color(0xFFCCCCCC),
-              letterSpacing: -0.5,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
-          const SizedBox(height: 2),
           Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Icon(icon, size: 13, color: iconColor.withValues(alpha: _hasData ? 0.6 : 0.3)),
-              const SizedBox(width: 4),
               Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w400,
-                  color: kTextSecondary,
-                  letterSpacing: 0.2,
+                hasTotal ? '${s.sleepHours!.toStringAsFixed(1)}h' : '—',
+                style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w700,
+                  color: hasTotal ? kTextPrimary : const Color(0xFFCCCCCC),
+                  letterSpacing: -0.5,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 5),
+                child: Icon(
+                  Icons.bedtime_outlined,
+                  size: 13,
+                  color: Colors.indigo.shade400.withValues(alpha: hasTotal ? 0.6 : 0.3),
+                ),
+              ),
+              const SizedBox(width: 4),
+              const Padding(
+                padding: EdgeInsets.only(bottom: 5),
+                child: Text(
+                  'Sleep',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w400,
+                    color: kTextSecondary,
+                    letterSpacing: 0.2,
+                  ),
                 ),
               ),
             ],
           ),
-          if (!_hasData && deviceHint != null) ...[
+          if (hasStages) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(child: _stageCell('Deep',  fmtHrs(s.sleepDeepMin),  Colors.indigo.shade700)),
+                Expanded(child: _stageCell('REM',   fmtHrs(s.sleepRemMin),   Colors.purple.shade400)),
+                Expanded(child: _stageCell('Light', fmtHrs(s.sleepLightMin), Colors.blue.shade300)),
+              ],
+            ),
+          ] else if (!hasTotal && hint != null) ...[
             const SizedBox(height: 4),
             Text(
-              deviceHint!,
-              style: const TextStyle(
-                fontSize: 9,
-                color: Color(0xFFAAAAAA),
-                height: 1.3,
-              ),
+              hint!,
+              style: const TextStyle(fontSize: 9, color: Color(0xFFAAAAAA), height: 1.3),
             ),
           ],
         ],
       ),
+    );
+  }
+
+  Widget _stageCell(String label, String value, Color dotColor) {
+    return Row(
+      children: [
+        Container(
+          width: 6, height: 6,
+          decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 10, color: kTextSecondary, fontWeight: FontWeight.w500),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          value,
+          style: const TextStyle(
+            fontSize: 11,
+            color: kTextPrimary,
+            fontWeight: FontWeight.w600,
+            fontFeatures: [FontFeature.tabularFigures()],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -845,6 +1319,9 @@ class _RiskInsightsCard extends StatelessWidget {
       // fetchFailed = all retries exhausted — show a distinct error state
       // so the user knows this is a problem, not a normal wait.
       if (fetchFailed) {
+        // Round-11: dropped the 'ABI —' placeholder pill.  The error
+        // state is now a simple message + Retry button — no jargon
+        // label sitting on top of an empty value.
         return _Card(
           child: Padding(
             padding: const EdgeInsets.all(4),
@@ -853,22 +1330,12 @@ class _RiskInsightsCard extends StatelessWidget {
               children: [
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade100,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Text(
-                        'HRI  —',
-                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: Colors.grey),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    const Expanded(
+                  children: const [
+                    Icon(Icons.cloud_off_outlined, size: 16, color: Colors.grey),
+                    SizedBox(width: 8),
+                    Expanded(
                       child: Text(
-                        'Could not load your score — please check your connection and try again.',
+                        'Could not load your insights — please check your connection and try again.',
                         style: TextStyle(fontSize: 12, color: Colors.grey),
                       ),
                     ),
@@ -894,17 +1361,20 @@ class _RiskInsightsCard extends StatelessWidget {
         );
       }
 
-      // Determine the right "no data" message based on context.
+      // Round-11: dropped the 'ABI —' placeholder pill from the
+      // no-data state and rephrased messages without the ABI label.
+      // Keeps the same three context branches (iPhone-only vs synced
+      // vs not-yet-synced) but in plain English.
       final String noDataMsg;
       if (iphoneOnly) {
-        noDataMsg = 'HRI scoring requires heart rate data from a wearable device '
-            '(e.g. Apple Watch Series 5+). Steps and sleep are tracked, '
-            'but cannot generate a risk score on their own.';
+        noDataMsg = 'Personalized insights require heart rate data from a '
+            'wearable device (e.g. Apple Watch Series 5+). Steps and sleep '
+            'are tracked, but cannot generate insights on their own.';
       } else if (hasSynced) {
-        noDataMsg = 'Synced — waiting for TikCare to compute your first score. '
+        noDataMsg = 'Synced — your insights will appear shortly. '
             'This can take a few minutes after your first sync.';
       } else {
-        noDataMsg = 'Sync your data to receive\npersonalized risk insights.';
+        noDataMsg = 'Sync your data to receive\npersonalized health insights.';
       }
 
       return _Card(
@@ -916,18 +1386,8 @@ class _RiskInsightsCard extends StatelessWidget {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade100,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Text(
-                      'HRI  —',
-                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: Colors.grey),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
+                  const Icon(Icons.shield_outlined, size: 16, color: Colors.grey),
+                  const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       noDataMsg,
@@ -941,7 +1401,7 @@ class _RiskInsightsCard extends StatelessWidget {
                 _AlertBanner(
                   color: Colors.orange,
                   icon: Icons.cloud_off_outlined,
-                  message: 'LifePulse API unreachable — configure server URL in Settings.',
+                  message: 'TikCare server unreachable — configure server URL in Settings.',
                 ),
               ],
             ],
@@ -951,90 +1411,89 @@ class _RiskInsightsCard extends StatelessWidget {
     }
 
     final s = insight!;
-    final hriColor = _hriColor(s.hriLabel, score: s.hriScore);
+
+    // v4.6: replaced the 80-pt ABI score circle + "Anomaly Burden Index"
+    // hero with a minimalist sync-status card. The composite ABI score was
+    // misleading — chronically-stable unhealthy users got "Excellent"
+    // because they didn't deviate from their (already-elevated) baseline.
+    // Per-metric data lives on the Risk tab now (Today's Signals panel).
+    // NOTE: fraudRiskScore is an insurer-side actuarial signal;
+    // it must NOT be displayed to the member (legal + UX risk).
+    final totalAlerts7d =
+        (s.anomalyBreakdown['severe'] ?? 0) +
+        (s.anomalyBreakdown['moderate'] ?? 0) +
+        (s.anomalyBreakdown['mild'] ?? 0);
+    final severeCount = s.anomalyBreakdown['severe'] ?? 0;
+    final moderateCount = s.anomalyBreakdown['moderate'] ?? 0;
+    final mildCount = totalAlerts7d - severeCount - moderateCount;
+
+    String alertSummary;
+    Color alertColor;
+    IconData alertIcon;
+    if (totalAlerts7d == 0) {
+      alertSummary = 'No alerts in the last 7 days';
+      alertColor = kGreen;
+      alertIcon = Icons.check_circle_outline;
+    } else if (severeCount > 0) {
+      alertSummary = '$severeCount severe · $moderateCount moderate · $mildCount mild (last 7 days)';
+      alertColor = kRed;
+      alertIcon = Icons.warning_amber_rounded;
+    } else if (moderateCount > 0) {
+      alertSummary = '$moderateCount moderate · $mildCount mild (last 7 days)';
+      alertColor = kOrange;
+      alertIcon = Icons.info_outline;
+    } else {
+      alertSummary = '$mildCount mild ${mildCount == 1 ? 'alert' : 'alerts'} in the last 7 days';
+      alertColor = kAmber;
+      alertIcon = Icons.info_outline;
+    }
 
     return Column(
       children: [
-        // HRI card — hero element (Stripe content-density: large score, small labels)
+        // Minimalist status card — sync time + alert summary, no score.
         _Card(
           padding: const EdgeInsets.all(16),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // HRI score circle — hero at 80px (was 66px)
-              Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  color: hriColor.withValues(alpha: 0.08),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: hriColor.withValues(alpha: 0.3), width: 2.5),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      s.hriScore > 0 ? '${s.hriScore}' : '--',
+              Row(
+                children: [
+                  Icon(alertIcon, size: 22, color: alertColor),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      alertSummary,
                       style: TextStyle(
-                        fontSize: 42,
-                        fontWeight: FontWeight.w300,  // Stripe: light weight for large numbers
-                        color: hriColor,
-                        letterSpacing: -1.5,
-                        height: 1.0,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                    Text(
-                      'HRI',
-                      style: TextStyle(
-                        fontSize: 10,
+                        fontSize: 14,
                         fontWeight: FontWeight.w600,
-                        color: hriColor.withValues(alpha: 0.7),
-                        letterSpacing: 1.5,
+                        color: alertColor,
+                        height: 1.35,
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Text(
-                          'Health Risk Index',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            fontSize: 15,
-                            color: kTextPrimary,
-                            letterSpacing: -0.2,
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        GestureDetector(
-                          onTap: () => _showHriExplanation(context),
-                          child: Icon(Icons.info_outline, size: 15, color: Colors.grey.shade400),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      _hriDescription(s),
-                      style: TextStyle(fontSize: 12, color: hriColor, fontWeight: FontWeight.w500),
-                    ),
-                    const SizedBox(height: 8),
-                    // Score bar: 0 ──[green]──[amber]──[orange]──[red]── 100
-                    _HriScaleBar(score: s.hriScore),
-                    const SizedBox(height: 5),
-                    Text(
-                      'Updated ${relativeTime(s.fetchedAt)}',
-                      style: const TextStyle(fontSize: 11, color: kTextSecondary),
-                    ),
-                    // NOTE: fraudRiskScore is an insurer-side actuarial signal;
-                    // it must NOT be displayed to the member (legal + UX risk).
-                  ],
-                ),
+              const SizedBox(height: 12),
+              // Round-11: tier badge wired in here.  Replaces the
+              // retired ABI score circle with a "what data depth do I
+              // have today" affordance — Basic / Comprehensive /
+              // Setting up.  Tap reveals active metrics + upgrade hint.
+              _AbiTierBadge(insight: s),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Icon(Icons.sync, size: 13, color: Colors.grey.shade400),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Last synced ${relativeTime(s.fetchedAt)}',
+                    style: const TextStyle(fontSize: 11.5, color: kTextSecondary),
+                  ),
+                  const Spacer(),
+                  Text(
+                    'Risk tab → details',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                  ),
+                ],
               ),
             ],
           ),
@@ -1085,101 +1544,18 @@ class _RiskInsightsCard extends StatelessWidget {
     );
   }
 
-  void _showHriExplanation(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.fromLTRB(24, 20, 24, 36),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              const Icon(Icons.shield_outlined, color: kNavy, size: 22),
-              const SizedBox(width: 10),
-              const Text('What is HRI?',
-                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: kNavy)),
-              const Spacer(),
-              IconButton(
-                icon: const Icon(Icons.close, size: 20),
-                onPressed: () => Navigator.pop(context),
-              ),
-            ]),
-            const SizedBox(height: 12),
-            const Text(
-              'HRI (Health Risk Index) is your personalized health risk score, ranging from 0 to 100. Lower is better.',
-              style: TextStyle(fontSize: 14, height: 1.5),
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              'It measures how much your recent heart rate, HRV, sleep, and activity deviate from YOUR personal baseline — not a population average.',
-              style: TextStyle(fontSize: 13, color: Colors.grey, height: 1.5),
-            ),
-            const SizedBox(height: 16),
-            // Score band table
-            _HriBandRow(color: kGreen, range: '0 – 25', label: 'Low Risk', desc: 'Healthy patterns, minimal deviations'),
-            const SizedBox(height: 8),
-            _HriBandRow(color: kAmber, range: '26 – 50', label: 'Moderate', desc: 'Some anomalies detected, worth monitoring'),
-            const SizedBox(height: 8),
-            _HriBandRow(color: kOrange, range: '51 – 75', label: 'Elevated', desc: 'Noticeable deviations from your baseline'),
-            const SizedBox(height: 8),
-            _HriBandRow(color: kRed, range: '76 – 100', label: 'High Risk', desc: 'Significant deviations — consult your doctor'),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.blue.shade50,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: const Text(
-                '💡 HRI is statistical, not clinical. It reflects changes in YOUR patterns. A high score does not mean you have a disease — it means your metrics have changed relative to your own history.',
-                style: TextStyle(fontSize: 12, color: Colors.blueAccent, height: 1.5),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Color _hriColor(String label, {int score = 1}) {
-    if (score == 0) return Colors.grey;
-    return switch (label) {
-      'critical' => kRed,
-      'high' => kOrange,
-      'moderate' => kAmber,
-      _ => kGreen,
-    };
-  }
-
-  String _hriDescription(RiskInsight s) {
-    if (s.hriScore == 0) {
-      return switch (s.baselineMaturity) {
-        'cold_start' => 'Day ${s.daysWithData} of 14 — keep syncing daily to activate HRI',
-        'developing' => 'Day ${s.daysWithData} of 30 — baseline still building',
-        _ => 'Activating…',
-      };
-    }
-    return switch (s.hriLabel) {
-      'critical' => 'Critical — immediate review recommended',
-      'high' => 'Elevated — monitor closely',
-      'moderate' => 'Moderate — some anomalies detected',
-      _ => 'Low — within normal range',
-    };
-  }
+  // Round-11: removed the dead ``_showHriExplanation`` modal (the
+  // "What is ABI?" tooltip), ``_hriColor``, and ``_hriDescription``
+  // helpers.  v4.6 retired the ABI score circle from the home card,
+  // and round-11 retired the term "ABI" from member-facing copy
+  // (Option B in the round-11 plan: keep tier signal, drop the
+  // opaque 0-100 number).  flutter analyze had been flagging these
+  // three as ``unused_element`` since round-9 — now actually deleted.
 
   String _formatMetric(String m) {
-    return switch (m) {
-      'HR_INSTANT' => 'Heart rate',
-      'HRV_SDNN' => 'HRV',
-      'SPO2_INSTANT' => 'Blood oxygen',
-      'HR_RESTING' => 'Resting HR',
-      'STEPS_DELTA' => 'Steps',
-      _ => m,
-    };
+    // Use MetricDisplay as the single source of truth for the user-facing label.
+    final label = MetricDisplay.label(m);
+    return label.isEmpty ? m : label;
   }
 }
 
@@ -1242,8 +1618,7 @@ class _AlertBanner extends StatelessWidget {
 
 class _ConnectionBadge extends StatelessWidget {
   final bool? apiOnline;
-  final VoidCallback onRefresh;
-  const _ConnectionBadge({required this.apiOnline, required this.onRefresh});
+  const _ConnectionBadge({required this.apiOnline});
 
   @override
   Widget build(BuildContext context) {
@@ -1253,9 +1628,13 @@ class _ConnectionBadge extends StatelessWidget {
     final label = isChecking
         ? 'Checking server…'
         : isOnline
-            ? 'LifePulse API connected'
-            : 'Cannot reach server — tap ↻ to retry';
+            ? 'TikCare server connected'
+            : 'Cannot reach server';
 
+    // Round-11: dropped the trailing refresh icon.  Tapping it called
+    // _checkApi (just pings /health) which the user perceived as a
+    // sync trigger — and on the next sync the connection check happens
+    // implicitly anyway, so the manual trigger added nothing.
     return Row(
       children: [
         Container(
@@ -1266,10 +1645,6 @@ class _ConnectionBadge extends StatelessWidget {
         const SizedBox(width: 6),
         Expanded(
           child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-        ),
-        GestureDetector(
-          onTap: onRefresh,
-          child: const Icon(Icons.refresh, size: 16, color: Colors.grey),
         ),
       ],
     );
@@ -1342,32 +1717,20 @@ class _LastSyncRow extends StatelessWidget {
 // ── Stale Sync Warning ────────────────────────────────────────────────────────
 
 class _StaleSyncWarning extends StatelessWidget {
-  final VoidCallback onSync;
-  const _StaleSyncWarning({required this.onSync});
+  const _StaleSyncWarning();
 
   @override
   Widget build(BuildContext context) {
+    // Round-11: dropped the trailing "Sync now" button.  The compact
+    // sync card directly below has the canonical action.
     return Row(
-      children: [
-        const Icon(Icons.warning_amber_rounded, size: 14, color: kAmber),
-        const SizedBox(width: 5),
-        const Expanded(
+      children: const [
+        Icon(Icons.warning_amber_rounded, size: 14, color: kAmber),
+        SizedBox(width: 5),
+        Expanded(
           child: Text(
             'Data may be outdated — last sync was over 24 hours ago.',
             style: TextStyle(fontSize: 12, color: kAmber),
-          ),
-        ),
-        TextButton(
-          onPressed: onSync,
-          style: TextButton.styleFrom(
-            foregroundColor: kNavy,
-            minimumSize: const Size(44, 44),
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          ),
-          child: const Text(
-            'Sync now',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
           ),
         ),
       ],
@@ -1556,18 +1919,21 @@ class _SetupStep extends StatelessWidget {
 // ── What We Sync Chips ────────────────────────────────────────────────────────
 
 class _WhatWeSyncChips extends StatelessWidget {
-  static const _metrics = [
-    (Icons.favorite, 'Heart Rate'),
-    (Icons.monitor_heart, 'HRV'),
-    (Icons.directions_walk, 'Steps'),
-    (Icons.water_drop, 'Blood O₂'),
-    (Icons.favorite_border, 'Resting HR'),
-    (Icons.timer_outlined, 'Exercise Time'),
-    (Icons.bedtime, 'Sleep'),
-    (Icons.air, 'Resp. Rate*'),
+  // (icon, label, key — must match keys passed via `active`)
+  static const _metrics = <(IconData, String, String)>[
+    (Icons.favorite, 'Heart Rate', 'hr'),
+    (Icons.monitor_heart, 'HRV', 'hrv'),
+    (Icons.directions_walk, 'Steps', 'steps'),
+    (Icons.water_drop, 'Blood O₂', 'spo2'),
+    (Icons.favorite_border, 'Resting HR', 'rhr'),
+    (Icons.timer_outlined, 'Exercise Time', 'exercise'),
+    (Icons.bedtime, 'Sleep', 'sleep'),
+    (Icons.air, 'Resp. Rate*', 'resp'),
   ];
 
-  const _WhatWeSyncChips();
+  final Set<String> active;
+
+  const _WhatWeSyncChips({this.active = const <String>{}});
 
   @override
   Widget build(BuildContext context) {
@@ -1577,24 +1943,29 @@ class _WhatWeSyncChips extends StatelessWidget {
         Wrap(
           spacing: 6,
           runSpacing: 4,
-          children: _metrics.map((m) => Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: const Color(0xFFEEF2FF),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(m.$1, size: 12, color: kNavy),
-                const SizedBox(width: 4),
-                Text(
-                  m.$2,
-                  style: const TextStyle(fontSize: 11, color: kNavy, fontWeight: FontWeight.w500),
-                ),
-              ],
-            ),
-          )).toList(),
+          children: _metrics.map((m) {
+            final isActive = active.contains(m.$3);
+            final bgColor = isActive ? const Color(0xFFEEF2FF) : const Color(0xFFF1F3F5);
+            final fgColor = isActive ? kNavy : Colors.grey.shade500;
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: bgColor,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(m.$1, size: 12, color: fgColor),
+                  const SizedBox(width: 4),
+                  Text(
+                    m.$2,
+                    style: TextStyle(fontSize: 11, color: fgColor, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
+            );
+          }).toList(),
         ),
         const SizedBox(height: 4),
         const Text(
@@ -1620,8 +1991,8 @@ class _CompactSyncSection extends StatefulWidget {
   final List<String> lastSyncDevices;
   final DateTime? lastSyncAt;
   final bool newDeviceDetected;
+  final Set<String> activeMetrics;
   final VoidCallback onSync;
-  final VoidCallback onCheckApi;
   final VoidCallback onDismissNewDevice;
 
   const _CompactSyncSection({
@@ -1636,8 +2007,8 @@ class _CompactSyncSection extends StatefulWidget {
     required this.lastSyncDevices,
     this.lastSyncAt,
     required this.newDeviceDetected,
+    this.activeMetrics = const <String>{},
     required this.onSync,
-    required this.onCheckApi,
     required this.onDismissNewDevice,
   });
 
@@ -1727,31 +2098,19 @@ class _CompactSyncSectionState extends State<_CompactSyncSection> {
           // Stale warning (always visible — important)
           if (isStale) ...[
             const SizedBox(height: 8),
-            _StaleSyncWarning(onSync: widget.onSync),
+            const _StaleSyncWarning(),
           ],
 
-          // Retry (always visible when failed)
-          if (!widget.syncing && widget.lastSyncSuccess == false &&
-              widget.lastSyncErrorType != SyncErrorType.permissionDenied &&
-              widget.lastSyncErrorType != SyncErrorType.authExpired) ...[
-            const SizedBox(height: 6),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                TextButton.icon(
-                  onPressed: widget.onSync,
-                  icon: const Icon(Icons.refresh, size: 14),
-                  label: const Text('Retry', style: TextStyle(fontSize: 12)),
-                  style: TextButton.styleFrom(foregroundColor: kNavy),
-                ),
-              ],
-            ),
-          ],
+          // Round-11: removed the inline "Retry" link that appeared
+          // above the bottom Sync Now button when last sync failed.
+          // Two buttons stacked (one small "Retry", one big "Sync Now")
+          // both calling _runSync was the visual redundancy the round-11
+          // audit flagged.  Bottom Sync Now is the only retry path now.
 
           // ── Expanded details ──
           if (_expanded) ...[
             const Divider(height: 20, color: kBorderColor),
-            _ConnectionBadge(apiOnline: widget.apiOnline, onRefresh: widget.onCheckApi),
+            _ConnectionBadge(apiOnline: widget.apiOnline),
             if (widget.lastSyncTime != null) ...[
               const SizedBox(height: 8),
               _LastSyncRow(
@@ -1769,24 +2128,28 @@ class _CompactSyncSectionState extends State<_CompactSyncSection> {
               ),
             ],
             const SizedBox(height: 10),
-            const _WhatWeSyncChips(),
+            _WhatWeSyncChips(active: widget.activeMetrics),
           ],
 
           // ── Sync button — always visible at the bottom of the card ──
           const SizedBox(height: 12),
           SizedBox(
             width: double.infinity,
-            child: GestureDetector(
-              onTap: widget.syncing ? null : widget.onSync,
-              child: Container(
-                padding: const EdgeInsets.symmetric(vertical: 11),
-                decoration: BoxDecoration(
-                  gradient: widget.syncing
-                      ? null
-                      : const LinearGradient(colors: [kNavy, kNavyLight]),
-                  color: widget.syncing ? kBorderColor : null,
-                  borderRadius: BorderRadius.circular(10),
-                ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: widget.syncing ? null : widget.onSync,
+                borderRadius: BorderRadius.circular(10),
+                splashColor: Colors.white24,
+                child: Ink(
+                  padding: const EdgeInsets.symmetric(vertical: 11),
+                  decoration: BoxDecoration(
+                    gradient: widget.syncing
+                        ? null
+                        : const LinearGradient(colors: [kNavy, kNavyLight]),
+                    color: widget.syncing ? kBorderColor : null,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
                 child: widget.syncing
                     ? const Row(
                         mainAxisAlignment: MainAxisAlignment.center,
@@ -1828,6 +2191,7 @@ class _CompactSyncSectionState extends State<_CompactSyncSection> {
               ),
             ),
           ),
+          ),
         ],
       ),
     );
@@ -1868,37 +2232,35 @@ class _Card extends StatelessWidget {
 
 class _CacheBanner extends StatelessWidget {
   final DateTime cachedAt;
-  final VoidCallback onTap;
-  const _CacheBanner({required this.cachedAt, required this.onTap});
+  const _CacheBanner({required this.cachedAt});
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-        decoration: BoxDecoration(
-          color: Colors.amber.shade50,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.amber.shade300),
-        ),
-        child: Row(
-          children: [
-            Icon(Icons.cloud_off_outlined, size: 15, color: Colors.amber.shade700),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Showing cached data from ${relativeTime(cachedAt)} — tap to sync',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.amber.shade800,
-                  fontWeight: FontWeight.w500,
-                ),
+    // Round-11: removed the GestureDetector + chevron + "tap to sync"
+    // affordance.  The bottom Sync Now button is the canonical action;
+    // this banner is now purely informational about cache age.
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: Colors.amber.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.amber.shade300),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.cloud_off_outlined, size: 15, color: Colors.amber.shade700),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Showing cached data from ${relativeTime(cachedAt)}',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.amber.shade800,
+                fontWeight: FontWeight.w500,
               ),
             ),
-            Icon(Icons.chevron_right, size: 16, color: Colors.amber.shade600),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -2030,12 +2392,12 @@ class _ErrorBannerState extends State<_ErrorBanner> {
                     _stepRow('1', 'Open the Health app on your iPhone'),
                     _stepRow('2', 'Tap your profile picture (top right)'),
                     _stepRow('3', 'Tap "Apps" under Privacy'),
-                    _stepRow('4', 'Find "TikCare LifePulse" and turn on all categories'),
+                    _stepRow('4', 'Find "Vitametric" and turn on all categories'),
                     _stepRow('5', 'Come back here — sync starts automatically'),
                   ] else ...[
                     _stepRow('1', 'Open Health Connect'),
                     _stepRow('2', 'Go to "App permissions"'),
-                    _stepRow('3', 'Find "TikCare LifePulse"'),
+                    _stepRow('3', 'Find "Vitametric"'),
                     _stepRow('4', 'Allow all data categories'),
                     _stepRow('5', 'Come back here — sync starts automatically'),
                   ],
@@ -2153,157 +2515,299 @@ class _ErrorBannerState extends State<_ErrorBanner> {
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 15, color: color),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              msg,
-              style: TextStyle(
-                fontSize: 12,
-                color: color,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-          if (widget.errorType == SyncErrorType.authExpired)
-            GestureDetector(
-              onTap: widget.onSignIn,
-              child: Text(
-                'Sign in',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: color,
-                  fontWeight: FontWeight.w700,
-                  decoration: TextDecoration.underline,
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-// ── First Sync / New-Device Banner ────────────────────────────────────────────
-
-class _FirstSyncBanner extends StatelessWidget {
-  final VoidCallback onSync;
-  final bool isReturningUser;
-  const _FirstSyncBanner({required this.onSync, this.isReturningUser = false});
-
-  @override
-  Widget build(BuildContext context) {
-    final title = isReturningUser
-        ? 'Welcome back — re-link your health data'
-        : 'Connect your Apple Watch / Health app';
-    final subtitle = isReturningUser
-        ? 'Your health history is safe. Tap to reconnect this device and keep your score up to date.'
-        : 'Grant access so TikCare can start building your personalized health risk score.';
-    final buttonLabel = isReturningUser ? 'Reconnect' : 'Connect Now';
-    final bgColor = isReturningUser
-        ? const Color(0xFFF0FFF4)   // green tint — reassuring
-        : const Color(0xFFEBF4FF);  // blue tint — onboarding
-    final borderColor = isReturningUser
-        ? const Color(0xFF9AE6B4)
-        : const Color(0xFF90CDF4);
-    final iconColor = isReturningUser ? kGreen : kNavy;
-    final icon = isReturningUser ? Icons.link : Icons.health_and_safety_outlined;
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: borderColor),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: iconColor, size: 26),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, size: 15, color: color),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  msg,
                   style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                    color: isReturningUser ? kGreen : kNavy,
+                    fontSize: 12,
+                    color: color,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
-                const SizedBox(height: 3),
-                Text(
-                  subtitle,
-                  style: const TextStyle(fontSize: 12, color: Colors.black54, height: 1.4),
+              ),
+              if (widget.errorType == SyncErrorType.authExpired)
+                GestureDetector(
+                  onTap: widget.onSignIn,
+                  child: Text(
+                    'Sign in',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: color,
+                      fontWeight: FontWeight.w700,
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
                 ),
-              ],
-            ),
+            ],
           ),
-          const SizedBox(width: 10),
-          TextButton(
-            onPressed: onSync,
-            style: TextButton.styleFrom(
-              backgroundColor: isReturningUser ? kGreen : kNavy,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          // Copy-diagnostic affordance — testers paste this into bug reports
+          // so we can triage without console access.
+          if (widget.errorType != SyncErrorType.authExpired) ...[
+            const SizedBox(height: 6),
+            GestureDetector(
+              onTap: () async {
+                final info = await HealthService.getDiagnosticInfo();
+                await Clipboard.setData(ClipboardData(text: info));
+                HapticFeedback.selectionClick();
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Diagnostic copied — paste in your bug report.'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              },
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Icon(Icons.copy_outlined, size: 12, color: color.withValues(alpha: 0.8)),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Copy diagnostic',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: color.withValues(alpha: 0.8),
+                      fontWeight: FontWeight.w600,
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            child: Text(buttonLabel, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
-          ),
+          ],
         ],
       ),
     );
   }
 }
 
-// ── HRI Scale Bar ─────────────────────────────────────────────────────────────
+// Round-11: deleted _FirstSyncBanner.  The "Connect Now" / "Reconnect"
+// banner duplicated the bottom Sync Now button and lingered after every
+// failed first sync.
 
-/// Thin 4-segment progress bar showing where the user's HRI score falls
-/// across the Low / Moderate / Elevated / High risk bands.
-class _HriScaleBar extends StatelessWidget {
-  final int score;
-  const _HriScaleBar({required this.score});
+// ── ABI Tier Badge ────────────────────────────────────────────────────────────
+/// Tier badge — Basic tracking / Comprehensive tracking / Setting up.
+///
+/// Shows the tier label as a pill plus a one-line explainer. All tiers are
+/// tappable: Base shows an upgrade hint, Comprehensive shows what advanced
+/// signals are active, Accumulating explains the 14-day requirement.
+class _AbiTierBadge extends StatelessWidget {
+  final RiskInsight insight;
+  const _AbiTierBadge({required this.insight});
+
+  // grey.shade400 extracted to a const so the chevron Icon can be const.
+  static const Color _kChevronGrey = Color(0xFFBDBDBD);
 
   @override
   Widget build(BuildContext context) {
-    if (score <= 0) return const SizedBox.shrink();
-    return LayoutBuilder(builder: (_, constraints) {
-      final total = constraints.maxWidth;
-      final indicator = (score.clamp(1, 100) / 100.0 * total).clamp(4.0, total - 4.0);
-      final dotColor = score < 26 ? kGreen : score < 51 ? kAmber : score < 76 ? kOrange : kRed;
-      return Stack(
-        children: [
-          Row(children: [kGreen, kAmber, kOrange, kRed].map((c) {
-            return Expanded(
-              child: Container(
-                height: 5,
-                margin: const EdgeInsets.symmetric(horizontal: 1),
-                decoration: BoxDecoration(
-                  color: c.withValues(alpha: 0.25),
-                  borderRadius: BorderRadius.circular(3),
+    final tier = AbiTierDisplay.parse(insight.abiTier);
+    final isEarly = insight.dataAdequacyStage == 'early';
+    final bg = AbiTierDisplay.badgeBackground(tier);
+    final fg = AbiTierDisplay.badgeForeground(tier);
+
+    return Semantics(
+      button: true,
+      label: '${AbiTierDisplay.label(tier)}. '
+          '${AbiTierDisplay.explainer(tier, earlyStage: isEarly)}'
+          '${isEarly ? '. Early stage — baseline still building.' : ''}',
+      child: GestureDetector(
+        onTap: () => _showTierDetails(context, tier, isEarly),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: bg,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                AbiTierDisplay.label(tier),
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: fg,
+                  letterSpacing: 0.5,
                 ),
               ),
-            );
-          }).toList()),
-          Positioned(
-            left: indicator - 4,
-            top: 0,
-            child: Container(
-              width: 8,
-              height: 5,
-              decoration: BoxDecoration(color: dotColor, borderRadius: BorderRadius.circular(3)),
             ),
-          ),
-        ],
-      );
-    });
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                AbiTierDisplay.explainer(tier, earlyStage: isEarly),
+                style: const TextStyle(
+                  fontSize: 10.5,
+                  color: kTextSecondary,
+                  fontWeight: FontWeight.w500,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            const Icon(Icons.chevron_right, size: 16, color: _kChevronGrey),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showTierDetails(BuildContext context, AbiTier tier, bool isEarly) {
+    final (title, body, footer) = switch (tier) {
+      AbiTier.base => _baseUpgradeContent(),
+      AbiTier.comprehensive => _comprehensiveDetailsContent(isEarly),
+      AbiTier.accumulating => _accumulatingDetailsContent(),
+    };
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetContext) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              body,
+              style: const TextStyle(fontSize: 13.5, color: kTextSecondary),
+            ),
+            if (footer != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                footer,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: kTextSecondary,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ],
+            const SizedBox(height: 16),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: () => Navigator.of(sheetContext).pop(),
+                child: const Text('Got it'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  (String, String, String?) _baseUpgradeContent() {
+    // Round-19: rewrite from the misleading "you need ALL these metrics
+    // from one device" listicle into per-device-class guidance.
+    //
+    // Three things were wrong with the old copy:
+    //   1. It listed every missing comprehensive metric (HRV / SpO₂ /
+    //      VO₂ Max / AFib / BP-Sys / BP-Dia / Exercise / Resp Rate) as
+    //      if all were required. In reality the backend tier upgrades
+    //      as soon as ANY ONE of them lands — see
+    //      app/core/reporting/daily.py:_classify_abi_tier.
+    //   2. The "Compatible: Apple Watch, Garmin, Withings, Polar" footer
+    //      lumped a wrist-worn watch and a stand-alone BP cuff into one
+    //      bucket. They unlock different metrics — Withings does BP, the
+    //      others do HRV / SpO₂ / VO₂ Max — and a member who already
+    //      owns an Apple Watch shouldn't be told to "buy a Withings"
+    //      to get comprehensive insights.
+    //   3. AFib detection requires Apple Watch S4+ specifically, not a
+    //      generic "smartwatch" — calling it out separately matters
+    //      because the device cohort that already has AFib (Series 1-3
+    //      owners) wouldn't be able to upgrade by re-pairing.
+    final missing = insight.abiMissingForUpgrade.toSet();
+    // Bucket missing metrics by which device class typically provides them.
+    final wristMetrics = <String>{
+      'HRV_SDNN', 'HRV_RMSSD', 'SPO2_INSTANT', 'VO2_MAX',
+      'EXERCISE_TIME', 'RESP_RATE',
+    }.intersection(missing);
+    final cuffMetrics = <String>{
+      'BP_SYSTOLIC', 'BP_DIASTOLIC',
+    }.intersection(missing);
+    final watchMetrics = <String>{'AFIB_FLAG'}.intersection(missing);
+
+    final body = StringBuffer(
+      'You\'ll move to comprehensive tracking as soon as ANY ONE '
+      'of these advanced signals starts coming in:\n',
+    );
+    if (wristMetrics.isNotEmpty) {
+      final names = wristMetrics
+          .map((m) => MetricDisplay.meta(m).label)
+          .join(', ');
+      body.write('\n• $names — most modern wrist wearables '
+          '(Apple Watch S4+, Garmin, Polar, Fitbit Sense / Charge 5+).');
+    }
+    if (watchMetrics.isNotEmpty) {
+      body.write('\n• AFib Detection — Apple Watch S4 or later '
+          '(or any FDA-cleared ECG wearable).');
+    }
+    if (cuffMetrics.isNotEmpty) {
+      body.write('\n• Blood Pressure — a connected cuff like '
+          'Withings BPM or Omron Connect.');
+    }
+    if (wristMetrics.isEmpty && watchMetrics.isEmpty && cuffMetrics.isEmpty) {
+      // Fallback when every comprehensive signal is already active —
+      // shouldn't reach this branch (would mean the tier is already
+      // comprehensive), but guard the copy just in case.
+      body.write('\nConnect any wearable that provides HRV, SpO₂ or '
+          'VO₂ Max to upgrade.');
+    }
+    return (
+      'Upgrade to comprehensive tracking',
+      body.toString(),
+      'You only need ONE of the above — not all of them. Adding more '
+      'devices later refines the signal mix.',
+    );
+  }
+
+  (String, String, String?) _comprehensiveDetailsContent(bool isEarly) {
+    final active = insight.abiActiveMetrics;
+    final friendly = active
+        .take(8)
+        .map((m) => MetricDisplay.meta(m).label)
+        .join(', ');
+    final earlyNote = isEarly
+        ? ' Your baseline is still maturing (early stage), so day-to-day swings may be larger than usual until you reach 30 days of data.'
+        : '';
+    return (
+      'Comprehensive tracking',
+      active.isEmpty
+          ? 'Your insights are computed from advanced signals like HRV, SpO₂, and VO₂ Max alongside heart rate and sleep.$earlyNote'
+          : 'Your insights are computed from these signals today: $friendly.$earlyNote',
+      'Personal-baseline insights are an engagement signal, not an insurance underwriting input.',
+    );
+  }
+
+  (String, String, String?) _accumulatingDetailsContent() {
+    final days = insight.daysWithData;
+    final remaining = (14 - days).clamp(1, 14);
+    return (
+      'Building Your Baseline',
+      'We need at least 14 days of data to compute meaningful insights. '
+          'Once your personal baseline is established, you\'ll see how today compares to your norm.\n\n'
+          '$days day${days == 1 ? '' : 's'} collected · $remaining more to go.',
+      'Keep your wearable on overnight to accelerate baseline maturity.',
+    );
   }
 }
+
+// Round-11: deleted _HriScaleBar — the 0-100 score bar was wired into the
+// retired `_showHriExplanation` modal that round-11 also removed.
 
 // ── iPhone-Only Mode Banner ───────────────────────────────────────────────────
 // Shown when the device has steps/sleep but no HR/HRV (iPhone without a watch).
@@ -2339,7 +2843,7 @@ class _IphoneOnlyBanner extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 const Text(
-                  'HRI scoring requires a wearable device such as Apple Watch Series 5+ or later. '
+                  'Personalized health insights require a wearable device such as Apple Watch Series 5+ or later. '
                   'Steps and sleep are still being tracked from your iPhone.',
                   style: TextStyle(fontSize: 12, color: Color(0xFF6B4F00), height: 1.4),
                 ),
@@ -2352,40 +2856,9 @@ class _IphoneOnlyBanner extends StatelessWidget {
   }
 }
 
-// ── HRI Band Row (for BottomSheet) ────────────────────────────────────────────
-
-class _HriBandRow extends StatelessWidget {
-  final Color color;
-  final String range;
-  final String label;
-  final String desc;
-  const _HriBandRow({required this.color, required this.range, required this.label, required this.desc});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(top: 2),
-          child: Container(
-            width: 12,
-            height: 12,
-            decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(3)),
-          ),
-        ),
-        const SizedBox(width: 8),
-        SizedBox(
-          width: 66,
-          child: Text(range, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-        ),
-        Expanded(
-          child: Text(
-            '$label — $desc',
-            style: const TextStyle(fontSize: 12, color: Colors.grey, height: 1.4),
-          ),
-        ),
-      ],
-    );
-  }
-}
+// Round-11: deleted _HriBandRow — wired only into the retired
+// `_showHriExplanation` modal.
+// Round-18: deleted _SignalsPlaceholder — its only callers (the standalone
+// Today's Signals section) were folded into _UnifiedHealthSection, which
+// renders one tile per metric with its own per-tile "no data" / "no
+// baseline" handling.

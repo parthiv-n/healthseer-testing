@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import '../services/health_service.dart';
+import '../services/sync_telemetry.dart';
+import '../utils/historical_gap_filler.dart';
 import '../models/trend_point.dart';
 import '../models/daily_report.dart';
 import '../utils/time_utils.dart';
+import '../utils/metric_display.dart';
+import '../widgets/historical_gap_banner.dart';
 import '../theme/colors.dart';
 
 class TrendsScreen extends StatefulWidget {
@@ -28,12 +32,67 @@ class _TrendsScreenState extends State<TrendsScreen> {
   DateTime? _cachedAt;
   List<DailyMetricPoint> _metricHistory = [];
   int? _localDays;
+  // Set when the gap-banner re-sync is in flight so we render a progress
+  // chip instead of the actionable banner. ``null`` outside a sync.
+  bool _resyncing = false;
 
   @override
   void initState() {
     super.initState();
     _load();
     _loadMetricHistory();
+  }
+
+  // Triggered when the Trends screen's gap banner is tapped. Mirrors the
+  // Profile page's "Re-sync Historical Data" flow but stays on-screen so
+  // the user can see the gap shrink in place instead of bouncing tabs.
+  Future<void> _runHistoricalResync(int gapDays) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Fill historical gap?', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+        content: Text(
+          'Re-uploads up to ${HealthService.kHistoricalSyncDays} days from Apple Health to backfill the '
+          '$gapDays missing days. Runs in weekly chunks — safe to interrupt; '
+          'duplicates are filtered automatically.',
+          style: const TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Re-sync', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _resyncing = true);
+    final result = await HealthService.syncDirect(
+      forceFullResync: true,
+      syncPath: SyncPath.historical,
+    );
+    if (result.success) {
+      // Mark the auto-fill throttle so a subsequent screen visit doesn't
+      // refire 12 hours later — the user already paid the bandwidth.
+      await HistoricalGapFiller.markComplete();
+    }
+    if (!mounted) return;
+    setState(() => _resyncing = false);
+
+    messenger.showSnackBar(SnackBar(
+      content: Text(result.success
+          ? 'Re-sync complete. Refreshing trends…'
+          : 'Re-sync failed: ${result.message}'),
+      backgroundColor: result.success ? Colors.green : Colors.red,
+    ));
+    if (result.success) {
+      // Reload the report so the gap banner disappears (or shrinks) in place.
+      _load();
+    }
   }
 
   Future<void> _loadMetricHistory() async {
@@ -59,8 +118,42 @@ class _TrendsScreenState extends State<TrendsScreen> {
             ? _customEnd!.difference(_customStart!).inDays.abs() + 1
             : 7)
         : _selectedDays;
-    HealthService.fetchLocalDaysWithData(days: days).then((count) {
-      if (mounted) setState(() => _localDays = count);
+    HealthService.fetchLocalDaysWithData(days: days).then((count) async {
+      if (!mounted) return;
+      setState(() => _localDays = count);
+      // Auto-fill: if Apple Health has materially more days than the
+      // backend has analyzed, kick off the chunked historical re-sync
+      // silently. Throttled to once per 12h via HistoricalGapFiller so
+      // we don't burn cellular every screen open.
+      final analyzed = _report?.daysWithData ?? 0;
+      final gap = count - analyzed;
+      if (gap > 0) {
+        final fut = await HistoricalGapFiller.maybeAutoFill(gap);
+        if (fut != null && mounted) {
+          setState(() => _resyncing = true);
+          // Subscribe to completion so the banner clears when the
+          // backfill finishes, regardless of success. Without this,
+          // `_resyncing=true` was set but never cleared — the banner
+          // showed "Filling the gap…" forever.
+          // ignore: unawaited_futures
+          fut.then((result) async {
+            if (!mounted) return;
+            if (result.success) await HistoricalGapFiller.markComplete();
+            setState(() => _resyncing = false);
+            // Reload so the gap banner re-evaluates against fresh server
+            // data (likely shrinks or disappears entirely).
+            if (result.success) _load();
+          });
+          // Defensive 3-minute cap — if syncDirect somehow never
+          // completes (orphaned Future, app suspended, etc.) we still
+          // recover the banner so the user isn't stuck.
+          Future.delayed(const Duration(minutes: 3), () {
+            if (mounted && _resyncing) {
+              setState(() => _resyncing = false);
+            }
+          });
+        }
+      }
     });
 
     RangeReport? report;
@@ -219,8 +312,13 @@ class _TrendsScreenState extends State<TrendsScreen> {
                   ),
                   const SizedBox(height: 12),
 
-                  // Cache banner for stale data
-                  if (_fromCache && _cachedAt != null) ...[
+                  // Cache banner for stale data — suppressed while a
+                  // backfill is in flight, because the gap-fill banner
+                  // already tells the user "we're getting fresh data
+                  // right now". Two stacked stale-data warnings on the
+                  // same screen ("cached from yesterday" + "filling the
+                  // gap…") was a UX-noise complaint from the tester.
+                  if (_fromCache && _cachedAt != null && !_resyncing) ...[
                     _TrendsCacheBanner(cachedAt: _cachedAt!, onRefresh: _load),
                     const SizedBox(height: 12),
                   ],
@@ -242,6 +340,8 @@ class _TrendsScreenState extends State<TrendsScreen> {
                           : _selectedDays,
                       metricHistory: _metricHistory,
                       localDays: _localDays,
+                      resyncing: _resyncing,
+                      onResync: _runHistoricalResync,
                     ),
                 ],
               ),
@@ -357,59 +457,70 @@ class _TrendsContent extends StatelessWidget {
   final int days;
   final List<DailyMetricPoint> metricHistory;
   final int? localDays;
-  const _TrendsContent({required this.report, required this.days, required this.metricHistory, this.localDays});
+  // Wired up by the parent state so the gap banner can show inline progress
+  // and trigger the historical re-sync without bouncing the user to Profile.
+  final bool resyncing;
+  final void Function(int gapDays)? onResync;
+  const _TrendsContent({
+    required this.report,
+    required this.days,
+    required this.metricHistory,
+    this.localDays,
+    this.resyncing = false,
+    this.onResync,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // Summary stats row
+        // Summary stats row — v4.6: dropped "Avg ABI" stat (the composite
+        // score we retired everywhere). Days analysed + anomaly count are
+        // honest concrete numbers.
         Row(
           children: [
-            Expanded(child: _StatCard(label: 'Avg HRI', value: report.avgHri.toStringAsFixed(1), subtitle: _hriLabel(report.avgHri), color: _hriColor(report.avgHri))),
+            // Days card: combine "X of Y" into the value so the subtitle
+            // line stays short and never overflows on narrow screens. Old
+            // copy ``5`` / ``of 7 in Health`` truncated as ``5 / of 7 in
+            // Healt…`` on iPhone Pro because the subtitle line had three
+            // wide characters per Days/Events/Alerts column.
+            Expanded(child: _StatCard(
+              label: 'Days',
+              value: localDays != null ? '${report.daysWithData}/$localDays' : '${report.daysWithData}',
+              // Round-17: shorten subtitle.  ``analysed of available`` was
+              // 21 chars and truncated as ``analysed of avai...`` on iPhone
+              // standard widths because three columns share ~110pt each.
+              // ``of available`` keeps the meaning compact.
+              subtitle: localDays != null ? 'of available' : 'analysed',
+              color: kNavy,
+            )),
             const SizedBox(width: 10),
-            Expanded(child: _StatCard(label: 'Analyzed', value: '${report.daysWithData}', subtitle: localDays != null ? 'of $localDays in Health' : 'of $days days', color: kNavy)),
+            Expanded(child: _StatCard(label: 'Events', value: '${report.totalEvents}', subtitle: 'analysed', color: kNavy)),
             const SizedBox(width: 10),
-            Expanded(child: _StatCard(label: 'Anomalies', value: '${report.totalAnomalies}', subtitle: 'detected', color: report.totalAnomalies > 5 ? kAmber : kGreen)),
+            Expanded(child: _StatCard(label: 'Alerts', value: '${report.totalAnomalies}', subtitle: 'detected', color: report.totalAnomalies > 5 ? kAmber : kGreen)),
           ],
         ),
 
-        // Gap banner: shown when Apple Health has more days than TikCare analyzed
+        // Gap banner: shown when Apple Health has more days than Vitametric
+        // analyzed. Tappable directly via the shared HistoricalGapBanner
+        // widget (also used on Today screen), so users don't need to bounce
+        // to Profile → re-sync button to fix the gap.
         if (localDays != null && localDays! > report.daysWithData) ...[
           const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            decoration: BoxDecoration(
-              color: const Color(0xFFEFF6FF),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFFBFDBFE)),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.info_outline, size: 16, color: Color(0xFF3B82F6)),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    '${localDays! - report.daysWithData} days in Apple Health haven\'t been analyzed yet. Go to Profile → Re-sync Historical Data to fill the gap.',
-                    style: const TextStyle(fontSize: 12, color: Color(0xFF1E40AF), height: 1.4),
-                  ),
-                ),
-              ],
-            ),
+          HistoricalGapBanner(
+            gapDays: localDays! - report.daysWithData,
+            resyncing: resyncing,
+            onTap: onResync == null ? null : () => onResync!(localDays! - report.daysWithData),
           ),
         ],
 
         const SizedBox(height: 16),
 
-        // HRI Trend Chart
+        // v4.6: dropped the "Anomaly Burden Index" daily-trend chart — it
+        // visualised the same composite score we removed. Coverage chart
+        // stays — it's a concrete fact (how many metrics were captured each
+        // day), not a composite.
         if (report.dailyTrend.isNotEmpty) ...[
-          _ChartCard(
-            title: 'Health Risk Index',
-            subtitle: 'Daily HRI score (lower is better)',
-            child: _HriLineChart(points: report.dailyTrend),
-          ),
-          const SizedBox(height: 16),
-          // Coverage chart
           _ChartCard(
             title: 'Data Coverage',
             subtitle: 'How much health data was captured each day',
@@ -432,18 +543,28 @@ class _TrendsContent extends StatelessWidget {
     );
   }
 
+  // Source of truth: HriBands in lib/utils/metric_display.dart, mirrored from
+  // app/core/reporting/daily.py:_hri_label.
   String _hriLabel(double hri) {
-    if (hri < 25) return 'Low risk';
-    if (hri < 50) return 'Moderate';
-    if (hri < 75) return 'Elevated';
-    return 'High risk';
+    return switch (HriBands.label(hri)) {
+      'excellent' => 'Excellent',
+      'good' => 'Good',
+      'moderate' => 'Moderate',
+      'elevated' => 'Elevated',
+      'critical' => 'Critical',
+      _ => 'Unknown',
+    };
   }
 
   Color _hriColor(double hri) {
-    if (hri < 26) return kGreen;
-    if (hri < 51) return kAmber;
-    if (hri < 76) return kOrange;
-    return kRed;
+    return switch (HriBands.label(hri)) {
+      'excellent' => kGreen,
+      'good' => kGreen,
+      'moderate' => kAmber,
+      'elevated' => kOrange,
+      'critical' => kRed,
+      _ => Colors.grey,
+    };
   }
 }
 
@@ -468,8 +589,21 @@ class _StatCard extends StatelessWidget {
         children: [
           Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w500)),
           const SizedBox(height: 4),
-          Text(value, style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: color)),
-          Text(subtitle, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+          // FittedBox around the value scales down for unusually large
+          // numbers (e.g. event counts in the millions on demo tenants).
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(value,
+                maxLines: 1,
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: color)),
+          ),
+          // Subtitle ellipsis-truncates rather than overflowing the card
+          // bounds. Hover/long-press shows the full text.
+          Text(subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10, color: Colors.grey)),
         ],
       ),
     );
@@ -549,12 +683,25 @@ class _HriLineChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: (points.length / 4).ceilToDouble(),
+                reservedSize: 22,
+                interval: 1,
                 getTitlesWidget: (v, _) {
                   final i = v.toInt();
                   if (i < 0 || i >= points.length) return const SizedBox.shrink();
+                  // Round-17: cap visible labels at ~6 evenly spaced
+                  // points so they never overlap (same fix applied to
+                  // _CoverageBarChart / _MetricBarChart / _AfibBarChart /
+                  // _MetricLineChart).
+                  final showEvery = (points.length / 6).ceil().clamp(1, points.length);
+                  if (i % showEvery != 0 && i != points.length - 1) {
+                    return const SizedBox.shrink();
+                  }
                   final d = points[i].date;
-                  return Text('${d.month}/${d.day}', style: const TextStyle(fontSize: 9, color: Colors.grey));
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text('${d.month}/${d.day}',
+                        style: const TextStyle(fontSize: 9, color: Colors.grey)),
+                  );
                 },
               ),
             ),
@@ -597,18 +744,48 @@ class _CoverageBarChart extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Round-17: x-axis label interval was ``(points.length / 4).ceilToDouble()``
+    // which evaluated to a small integer (e.g. 5 for 20 days) but fl_chart's
+    // built-in bottom-titles renderer ignores this when the chart is narrow,
+    // packing every label and producing the unreadable ``4/3/4/5/6/7/8/9...``
+    // overlap shown in the round-17 audit screenshot.  Cap the visible labels
+    // at ~6 per chart row regardless of point count, AND give each label a
+    // reservedSize so fl_chart hands the renderer enough space to draw it.
+    final showEvery = (points.length / 6).ceil().clamp(1, points.length);
     return SizedBox(
-      height: 100,
+      height: 130,  // +10 to fit the larger reservedSize
       child: BarChart(
         BarChartData(
           maxY: 1.0,
           gridData: const FlGridData(show: false),
           borderData: FlBorderData(show: false),
-          titlesData: const FlTitlesData(
-            leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          titlesData: FlTitlesData(
+            leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            bottomTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                reservedSize: 22,
+                interval: 1, // we control via getTitlesWidget filter
+                getTitlesWidget: (v, _) {
+                  final i = v.toInt();
+                  if (i < 0 || i >= points.length) return const SizedBox.shrink();
+                  // Show a label at ~6 evenly spaced indices only.
+                  if (i % showEvery != 0 && i != points.length - 1) {
+                    return const SizedBox.shrink();
+                  }
+                  final d = points[i].date;
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '${d.month}/${d.day}',
+                      style: const TextStyle(fontSize: 9, color: Colors.grey),
+                    ),
+                  );
+                },
+              ),
+            ),
           ),
           barGroups: points.asMap().entries.map((e) {
             final coverage = e.value.coverageScore.clamp(0.0, 1.0);
@@ -899,14 +1076,14 @@ class _MetricChartSectionState extends State<_MetricChartSection> {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             child: switch (effectiveTab) {
-              0 => _MetricLineChart(points: widget.points, getValue: (p) => p.avgHr,          color: Colors.red,    unit: 'bpm', label: 'Avg Heart Rate'),
+              0 => _MetricLineChart(points: widget.points, getValue: (p) => p.avgHr,          color: Colors.red,    unit: 'bpm', label: 'Heart Rate'),
               1 => _MetricLineChart(points: widget.points, getValue: (p) => p.hrv,            color: Colors.blue,   unit: 'ms',  label: 'HRV'),
               2 => _MetricBarChart( points: widget.points, getValue: (p) => p.steps?.toDouble(), color: kNavy,      unit: 'steps', label: 'Daily Steps'),
               3 => _MetricBarChart( points: widget.points, getValue: (p) => p.sleepHours,     color: Colors.indigo, unit: 'h',   label: 'Sleep'),
               4 => _MetricLineChart(points: widget.points, getValue: (p) => p.rhr,            color: Colors.pink,   unit: 'bpm', label: 'Resting Heart Rate'),
               5 => _MetricLineChart(points: widget.points, getValue: (p) => p.spo2,           color: Colors.cyan,   unit: '%',   label: 'Blood Oxygen (SpO2)'),
               6 => _MetricBarChart( points: widget.points, getValue: (p) => p.exerciseMin?.toDouble(), color: Colors.green, unit: 'min', label: 'Exercise Time'),
-              7 => _MetricLineChart(points: widget.points, getValue: (p) => p.respRate,       color: Colors.teal,   unit: 'br/m', label: 'Respiratory Rate'),
+              7 => _MetricLineChart(points: widget.points, getValue: (p) => p.respRate,       color: Colors.teal,   unit: 'breaths/min', label: 'Respiratory Rate'),
               _ => _AfibBarChart(points: widget.points),
             },
           ),
@@ -941,10 +1118,17 @@ class _AfibBarChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: (points.length / 4).ceilToDouble().clamp(1, 30),
+                reservedSize: 22,
+                interval: 1,
                 getTitlesWidget: (val, _) {
                   final idx = val.toInt();
                   if (idx < 0 || idx >= points.length) return const SizedBox.shrink();
+                  // Round-17 x-axis label dedup: cap visible labels at
+                  // ~6 evenly spaced indices so dates don't overlap.
+                  final showEvery = (points.length / 6).ceil().clamp(1, points.length);
+                  if (idx % showEvery != 0 && idx != points.length - 1) {
+                    return const SizedBox.shrink();
+                  }
                   final d = points[idx].date;
                   return Padding(
                     padding: const EdgeInsets.only(top: 4),
@@ -977,6 +1161,33 @@ class _AfibBarChart extends StatelessWidget {
   }
 }
 
+// Tiny header shared by both chart classes — the y-axis used to render
+// bare numbers (``42``, ``21``, ``0.0``) with no unit, leaving the user
+// to guess whether "21" was minutes or hours. The unit now sits on its
+// own row above the chart so the axis stays uncluttered.
+Widget _chartHeader(String label, String unit, Color color) {
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 6),
+    child: Row(
+      children: [
+        Text(label,
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: color.withValues(alpha: 0.85))),
+        const SizedBox(width: 6),
+        if (unit.isNotEmpty)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(unit,
+                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: color.withValues(alpha: 0.85))),
+          ),
+      ],
+    ),
+  );
+}
+
 class _MetricLineChart extends StatelessWidget {
   final List<DailyMetricPoint> points;
   final double? Function(DailyMetricPoint) getValue;
@@ -1001,7 +1212,13 @@ class _MetricLineChart extends StatelessWidget {
         .toList();
 
     if (validPoints.isEmpty) {
-      return const SizedBox(height: 140, child: Center(child: Text('No data', style: TextStyle(color: Colors.grey))));
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _chartHeader(label, unit, color),
+          const SizedBox(height: 140, child: Center(child: Text('No data', style: TextStyle(color: Colors.grey)))),
+        ],
+      );
     }
 
     final vals = validPoints.map((e) => getValue(e.value)!).toList();
@@ -1013,7 +1230,11 @@ class _MetricLineChart extends StatelessWidget {
         .map((e) => FlSpot(e.key.toDouble(), getValue(e.value)!))
         .toList();
 
-    return SizedBox(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _chartHeader(label, unit, color),
+        SizedBox(
       height: 140,
       child: LineChart(
         LineChartData(
@@ -1038,10 +1259,17 @@ class _MetricLineChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: (points.length / 4).ceilToDouble().clamp(1, 30),
+                reservedSize: 22,
+                interval: 1,
                 getTitlesWidget: (val, _) {
                   final idx = val.toInt();
                   if (idx < 0 || idx >= points.length) return const SizedBox.shrink();
+                  // Round-17 x-axis label dedup: cap visible labels at
+                  // ~6 evenly spaced indices so dates don't overlap.
+                  final showEvery = (points.length / 6).ceil().clamp(1, points.length);
+                  if (idx % showEvery != 0 && idx != points.length - 1) {
+                    return const SizedBox.shrink();
+                  }
                   final d = points[idx].date;
                   return Padding(
                     padding: const EdgeInsets.only(top: 4),
@@ -1070,6 +1298,8 @@ class _MetricLineChart extends StatelessWidget {
           ],
         ),
       ),
+        ),
+      ],
     );
   }
 }
@@ -1093,7 +1323,13 @@ class _MetricBarChart extends StatelessWidget {
   Widget build(BuildContext context) {
     final hasAny = points.any((p) => getValue(p) != null);
     if (!hasAny) {
-      return const SizedBox(height: 140, child: Center(child: Text('No data', style: TextStyle(color: Colors.grey))));
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _chartHeader(label, unit, color),
+          const SizedBox(height: 140, child: Center(child: Text('No data', style: TextStyle(color: Colors.grey)))),
+        ],
+      );
     }
 
     final maxVal = points
@@ -1101,7 +1337,11 @@ class _MetricBarChart extends StatelessWidget {
         .map((p) => getValue(p)!)
         .reduce((a, b) => a > b ? a : b);
 
-    return SizedBox(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _chartHeader(label, unit, color),
+        SizedBox(
       height: 140,
       child: BarChart(
         BarChartData(
@@ -1130,10 +1370,17 @@ class _MetricBarChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: (points.length / 4).ceilToDouble().clamp(1, 30),
+                reservedSize: 22,
+                interval: 1,
                 getTitlesWidget: (val, _) {
                   final idx = val.toInt();
                   if (idx < 0 || idx >= points.length) return const SizedBox.shrink();
+                  // Round-17 x-axis label dedup: cap visible labels at
+                  // ~6 evenly spaced indices so dates don't overlap.
+                  final showEvery = (points.length / 6).ceil().clamp(1, points.length);
+                  if (idx % showEvery != 0 && idx != points.length - 1) {
+                    return const SizedBox.shrink();
+                  }
                   final d = points[idx].date;
                   return Padding(
                     padding: const EdgeInsets.only(top: 4),
@@ -1159,6 +1406,8 @@ class _MetricBarChart extends StatelessWidget {
           }).toList(),
         ),
       ),
+        ),
+      ],
     );
   }
 }

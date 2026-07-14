@@ -56,7 +56,7 @@ post_install do |installer|
       # (and similar generated Swift-ObjC headers) can be found at build time.
       config.build_settings['HEADER_SEARCH_PATHS'] =
         '$(inherited) $(PODS_CONFIGURATION_BUILD_DIR)'
-      if ['health', 'workmanager'].include?(target.name)
+      if ['health', 'workmanager_apple'].include?(target.name)
         config.build_settings['DEFINES_MODULE'] = 'YES'
       end
     end

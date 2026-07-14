@@ -34,6 +34,7 @@ class RangeReport {
   final int daysWithData;
   final double avgHri;
   final int totalAnomalies;
+  final int totalEvents;
   final List<TrendPoint> dailyTrend;
   final DateTime fetchedAt;
 
@@ -43,6 +44,7 @@ class RangeReport {
     required this.daysWithData,
     required this.avgHri,
     required this.totalAnomalies,
+    required this.totalEvents,
     required this.dailyTrend,
     required this.fetchedAt,
   });
@@ -57,6 +59,7 @@ class RangeReport {
       daysWithData: (j['days_with_data'] as num?)?.toInt() ?? 0,
       avgHri: (j['avg_hri'] as num?)?.toDouble() ?? 0.0,
       totalAnomalies: (j['total_anomalies'] as num?)?.toInt() ?? 0,
+      totalEvents: (j['total_events'] as num?)?.toInt() ?? 0,
       dailyTrend: trend,
       fetchedAt: DateTime.now(),
     );

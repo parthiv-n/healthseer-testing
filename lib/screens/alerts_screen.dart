@@ -127,7 +127,7 @@ class _AlertsScreenState extends State<AlertsScreen> {
                       children: [
                         Text('Health Alerts', style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
                         SizedBox(height: 2),
-                        Text('Anomalies detected by TikCare AI', style: TextStyle(color: Colors.white60, fontSize: 13)),
+                        Text('Unusual patterns in your health data', style: TextStyle(color: Colors.white60, fontSize: 13)),
                       ],
                     ),
                   ),

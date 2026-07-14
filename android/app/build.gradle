@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.tikcare.lifepulse_test_app"
+    namespace = "com.tikcare.vitametric"
     compileSdk = 34
     ndkVersion = flutter.ndkVersion
 
@@ -20,7 +20,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.tikcare.lifepulse_test_app"
+        applicationId = "com.tikcare.vitametric"
         minSdk = 26          // Android 8.0 — Health Connect requires API 26+
         targetSdk = 34
         versionCode = flutter.versionCode

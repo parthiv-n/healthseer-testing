@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/health_service.dart';
+import '../services/sync_state.dart';
+import '../services/sync_telemetry.dart';
 import '../models/daily_report.dart';
 import '../theme/colors.dart';
 
@@ -43,6 +45,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final email = await HealthService.getLoggedInEmail();
       final prefs = await SharedPreferences.getInstance();
       final showLog = prefs.getBool('show_debug_log') ?? false;
+      // Track B: load sync state from SyncStateStore — the legacy
+      // SharedPrefs keys (last_sync_time / last_event_count /
+      // last_sync_success) are deleted by migrate() and would all
+      // return null for any upgraded user.
+      await SyncStateStore.instance.load();
+      final syncState = SyncStateStore.instance.value;
+      String? successLabel;
+      if (syncState.lastSuccessAtIso != null) {
+        final dt = DateTime.tryParse(syncState.lastSuccessAtIso!);
+        if (dt != null) {
+          final hh = dt.hour.toString().padLeft(2, '0');
+          final mm = dt.minute.toString().padLeft(2, '0');
+          successLabel = '${dt.month}/${dt.day} $hh:$mm';
+        }
+      }
       final results = await Future.wait([
         HealthService.fetchUserProfile(),
         HealthService.fetchDailyReport(),
@@ -54,9 +71,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _showDebugLog = showLog;
           _profile = results[0] as Map<String, dynamic>?;
           _dailyReport = results[1] as DailyReport?;
-          _lastSyncTime = prefs.getString('last_sync_time');
-          _lastSyncEventCount = prefs.getInt('last_event_count');
-          _lastSyncSuccess = prefs.getBool('last_sync_success');
+          _lastSyncTime = successLabel;
+          _lastSyncEventCount = syncState.lastEventCount;
+          _lastSyncSuccess = syncState.lastAttemptAtIso == null
+              ? null
+              : !syncState.lastAttemptFailed;
           _lastSyncDevices = prefs.getStringList('last_sync_devices') ?? [];
         });
       }
@@ -82,9 +101,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
           SizedBox(width: 8),
           Text('Re-sync Historical Data', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
         ]),
-        content: const Text(
-          'This will re-upload the last 365 days from Apple Health to fill any gaps. It runs in weekly chunks so it\'s safe to interrupt — progress is saved.\n\nDuplicate data is automatically filtered.',
-          style: TextStyle(fontSize: 13, height: 1.5),
+        content: Text(
+          'This will re-upload the last ${HealthService.kHistoricalSyncDays} days from Apple Health to fill any gaps. It runs in weekly chunks so it\'s safe to interrupt — progress is saved.\n\nDuplicate data is automatically filtered.',
+          style: const TextStyle(fontSize: 13, height: 1.5),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
@@ -98,7 +117,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (confirmed != true || !mounted) return;
 
     setState(() => _resyncingHistorical = true);
-    final result = await HealthService.syncDirect(forceFullResync: true);
+    final result = await HealthService.syncDirect(
+      forceFullResync: true,
+      syncPath: SyncPath.historical,
+    );
     if (!mounted) return;
     setState(() => _resyncingHistorical = false);
 
@@ -154,7 +176,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Future<void> _testConnection() async {
     setState(() { _testing = true; _testSuccess = null; });
-    final result = await HealthService.pingLifePulse();
+    final result = await HealthService.pingVitametric();
     if (mounted) setState(() { _testing = false; _testSuccess = result.success; });
   }
 
@@ -377,7 +399,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         const Divider(height: 20),
                         GestureDetector(
                           onTap: () async {
-                            final uri = Uri.parse('https://tikcare.co/privacy');
+                            final uri = Uri.parse('https://tikcare.co/privacy-policy/');
                             if (await canLaunchUrl(uri)) {
                               await launchUrl(uri, mode: LaunchMode.externalApplication);
                             }
@@ -421,9 +443,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       children: [
                         _SectionLabel(label: 'HISTORICAL DATA'),
                         const SizedBox(height: 8),
-                        const Text(
-                          'Missing past health data? Re-sync uploads the last 180 days from Apple Health to fill any gaps.',
-                          style: TextStyle(fontSize: 12, color: Colors.grey, height: 1.4),
+                        Text(
+                          'Missing past health data? Re-sync uploads the last ${HealthService.kHistoricalSyncDays} days from Apple Health to fill any gaps.',
+                          style: const TextStyle(fontSize: 12, color: Colors.grey, height: 1.4),
                         ),
                         const SizedBox(height: 12),
                         ValueListenableBuilder<String?>(
@@ -465,34 +487,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           children: [
                             const Icon(Icons.cloud_outlined, size: 16, color: Colors.grey),
                             const SizedBox(width: 8),
-                            const Expanded(child: Text('LifePulse API', style: TextStyle(fontSize: 13))),
+                            const Expanded(child: Text('Vitametric API', style: TextStyle(fontSize: 13))),
                             if (_testing)
                               const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: kNavy))
                             else if (_testSuccess == true)
                               const Icon(Icons.check_circle, size: 16, color: kGreen)
                             else if (_testSuccess == false)
                               const Icon(Icons.error_outline, size: 16, color: Colors.red),
-                            const SizedBox(width: 8),
-                            GestureDetector(
-                              onTap: _testing ? null : _testConnection,
-                              child: const Text('Test', style: TextStyle(fontSize: 12, color: kNavy, fontWeight: FontWeight.w600)),
-                            ),
                           ],
                         ),
-                        const Divider(height: 20),
-                        Row(
-                          children: [
-                            const Icon(Icons.terminal, size: 16, color: Colors.grey),
-                            const SizedBox(width: 8),
-                            const Expanded(child: Text('Show Sync Log', style: TextStyle(fontSize: 13))),
-                            Switch.adaptive(
-                              value: _showDebugLog,
-                              onChanged: _toggleDebugLog,
-                              activeThumbColor: kNavy,
-                              activeTrackColor: kNavy.withValues(alpha: 0.4),
-                            ),
-                          ],
-                        ),
+                        // Dev-only: API test button + sync log toggle
+                        if (kDebugMode) ...[
+                          const Divider(height: 20),
+                          Row(
+                            children: [
+                              const Icon(Icons.bug_report_outlined, size: 16, color: Colors.grey),
+                              const SizedBox(width: 8),
+                              GestureDetector(
+                                onTap: _testing ? null : _testConnection,
+                                child: const Text('Test Connection', style: TextStyle(fontSize: 12, color: kNavy, fontWeight: FontWeight.w600)),
+                              ),
+                            ],
+                          ),
+                          const Divider(height: 20),
+                          Row(
+                            children: [
+                              const Icon(Icons.terminal, size: 16, color: Colors.grey),
+                              const SizedBox(width: 8),
+                              const Expanded(child: Text('Show Sync Log', style: TextStyle(fontSize: 13))),
+                              Switch.adaptive(
+                                value: _showDebugLog,
+                                onChanged: _toggleDebugLog,
+                                activeThumbColor: kNavy,
+                                activeTrackColor: kNavy.withValues(alpha: 0.4),
+                              ),
+                            ],
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -536,6 +567,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             label: const Text('Clear All My Health Data', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                           ),
                         ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.orange.shade700,
+                              side: BorderSide(color: Colors.orange.shade300),
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                            ),
+                            onPressed: () => Navigator.of(context).pushNamed('/dev-tools'),
+                            icon: const Icon(Icons.build_outlined, size: 16),
+                            label: const Text('Developer Tools', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -571,7 +617,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   ),
 
                   const SizedBox(height: 4),
-                  const Text('TikCare LifePulse v1.0.0 (7)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  // Long-press the version label to reach the hidden Dev Tools
+                  // screen (on-device sync verification). Version string is
+                  // derived from BuildMetadata (CFBundle values) rather than a
+                  // hard-coded literal so it never drifts from the real build.
+                  GestureDetector(
+                    onLongPress: () =>
+                        Navigator.of(context).pushNamed('/dev-tools'),
+                    behavior: HitTestBehavior.opaque,
+                    child: Text(
+                      'Vitametric v${BuildMetadata.version} (${BuildMetadata.build})',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ),
                 ],
               ),
             ),

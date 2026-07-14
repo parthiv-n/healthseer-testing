@@ -1,40 +1,79 @@
-/// Local HealthKit summary for today — shown immediately without network.
+/// Local HealthKit summary for the home screen.
+///
+/// Two semantic groups:
+/// 1. **Latest-reading metrics** — HR, HRV, RHR, SpO2, RespRate, BP, AFib.
+///    We show the most recent sample with a `…SampleAt` timestamp regardless
+///    of how old it is, mirroring Apple Health which displays
+///    "yesterday 8:17 pm — 76 bpm" instead of hiding the value after 24h.
+/// 2. **Today-aggregated metrics** — Steps, Exercise, Sleep. These reset at
+///    local midnight to match Apple Fitness rings; no per-metric timestamp.
 class HealthSnapshot {
-  final double? avgHr;        // bpm  (mean of today's HR_INSTANT, primary source)
-  final int? steps;           // count (HKStatisticsQuery cumulativeSum — source-deduplicated)
-  final double? sleepHours;   // hours (DEEP + REM + LIGHT stages, or SLEEP_ASLEEP fallback)
-  final double? hrv;          // ms   (latest HRV_SDNN reading today)
-  final double? spo2;         // %    (latest BLOOD_OXYGEN reading today)
-  final double? rhr;          // bpm  (today's RESTING_HEART_RATE — Apple writes one/day)
-  final int? exerciseMin;     // min  (sum of EXERCISE_TIME intervals today)
-  final double? respRate;     // breaths/min (latest RESPIRATORY_RATE, Watch S6+ only)
-  final double? bpSystolic;   // mmHg (latest BP_SYSTOLIC — requires 3rd-party BP cuff app)
-  final double? bpDiastolic;  // mmHg (latest BP_DIASTOLIC — requires 3rd-party BP cuff app)
-  final bool? afibDetected;   // true/false (ATRIAL_FIBRILLATION_BURDEN > 0, iOS 16+ / Watch)
+  // ── Latest-reading metrics (value + when measured) ─────────────────────
+  final double? latestHr;
+  final DateTime? hrSampleAt;
+  final double? hrv;
+  final DateTime? hrvSampleAt;
+  final double? rhr;
+  final DateTime? rhrSampleAt;
+  final double? spo2;
+  final DateTime? spo2SampleAt;
+  final double? respRate;
+  final DateTime? respRateSampleAt;
+  final double? bpSystolic;
+  final double? bpDiastolic;
+  final DateTime? bpSampleAt; // shared (cuff writes both at once)
+  final bool? afibDetected;
+  final DateTime? afibSampleAt;
+
+  // ── Today-aggregated metrics (midnight reset) ──────────────────────────
+  final int? steps;
+  final int? exerciseMin;
+  final double? sleepHours;
+  final int? sleepDeepMin;
+  final int? sleepRemMin;
+  final int? sleepLightMin;
+
   final DateTime fetchedAt;
 
-  /// The app or device that contributed the most HR readings today,
+  /// The app/device that contributed the most HR readings in the last week,
   /// e.g. "Apple Watch", "Garmin Connect", "iPhone".
   final String? primarySource;
 
+  /// True when no HR sample exists at all in the last 7 days. Used to drive
+  /// the "iPhone-only" banner — a much more reliable signal than "no HR in
+  /// the last 24h" (which mis-fires whenever a user takes the watch off
+  /// overnight to charge).
+  final bool noHrLast7Days;
+
   const HealthSnapshot({
-    this.avgHr,
-    this.steps,
-    this.sleepHours,
+    this.latestHr,
+    this.hrSampleAt,
     this.hrv,
-    this.spo2,
+    this.hrvSampleAt,
     this.rhr,
-    this.exerciseMin,
+    this.rhrSampleAt,
+    this.spo2,
+    this.spo2SampleAt,
     this.respRate,
+    this.respRateSampleAt,
     this.bpSystolic,
     this.bpDiastolic,
+    this.bpSampleAt,
     this.afibDetected,
+    this.afibSampleAt,
+    this.steps,
+    this.exerciseMin,
+    this.sleepHours,
+    this.sleepDeepMin,
+    this.sleepRemMin,
+    this.sleepLightMin,
     required this.fetchedAt,
     this.primarySource,
+    this.noHrLast7Days = false,
   });
 
   bool get hasData =>
-      avgHr != null || steps != null || sleepHours != null || hrv != null ||
+      latestHr != null || steps != null || sleepHours != null || hrv != null ||
       spo2 != null || rhr != null || exerciseMin != null || respRate != null ||
       bpSystolic != null || bpDiastolic != null || afibDetected != null;
 }

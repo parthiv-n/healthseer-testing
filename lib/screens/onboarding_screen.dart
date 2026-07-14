@@ -20,27 +20,26 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       icon: Icons.favorite,
       title: 'Welcome to TikCare',
       subtitle:
-          'TikCare LifePulse intelligently analyzes your wearable health data '
-          'to help your insurance provider understand and support your wellbeing.',
+          'Connect your wearable, and we\'ll turn your daily health data '
+          'into a simple wellness score your insurer can use to reward '
+          'healthy habits.',
       iconColor: kRed,
     ),
     _OnboardingPage(
       icon: Icons.sync_rounded,
       title: 'How it works',
       subtitle:
-          'Your Apple Watch or wearable syncs health metrics every 6 hours. '
-          'TikCare AI analyzes patterns like heart rate, HRV, sleep, and activity '
-          'to detect meaningful changes and generate your Health Risk Index.',
+          'Your watch syncs automatically in the background. '
+          'We look at heart rate, sleep, activity, and more to track '
+          'trends over time — no manual logging needed.',
       iconColor: kNavyLight,
     ),
     _OnboardingPage(
       icon: Icons.shield_outlined,
-      title: 'Your privacy',
+      title: 'Your data is safe',
       subtitle:
-          'Your health data is shared with your insurance provider solely for '
-          'risk scoring and wellbeing support. GPS location, contacts, and '
-          'photos are never accessed. You may request deletion of your data '
-          'at any time.',
+          'Only health metrics are shared — never your location, photos, '
+          'or contacts. You can delete your data at any time from Settings.',
       iconColor: kGreen,
     ),
   ];
@@ -236,7 +235,7 @@ class _PageContent extends StatelessWidget {
               ),
               const SizedBox(width: 7),
               const Text(
-                'TikCare LifePulse',
+                'Vitametric',
                 style: TextStyle(
                   fontSize: 13,
                   color: kNavy,

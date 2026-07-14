@@ -1,7 +1,7 @@
-name: lifepulse_test_app
-description: "TikCare LifePulse – device connection test app (iOS / HealthKit)"
+name: vitametric_app
+description: "Vitametric — health tracking app (iOS / HealthKit + Android / Health Connect)"
 publish_to: 'none'
-version: 1.0.0+10
+version: 1.1.0+33
 
 environment:
   sdk: ^3.6.1
@@ -9,36 +9,35 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
+  cupertino_icons: ^1.0.9
 
   # Official health package — HealthKit (iOS) + Health Connect (Android)
   health: ^13.3.1
 
   # Persistent storage for API config
-  shared_preferences: ^2.2.3
+  shared_preferences: ^2.5.5
 
   # HTTP client for direct Partner API calls (bypass mode)
   http: ^1.2.1
 
   # Background sync (iOS Background Fetch / Android WorkManager)
-  workmanager: ^0.7.0
-  fl_chart: ^0.68.0
+  workmanager: ^0.9.0
+  fl_chart: ^1.2.0
   url_launcher: ^6.3.0
 
   # Secure credential storage (iOS Keychain / Android Keystore)
-  flutter_secure_storage: ^9.2.2
+  flutter_secure_storage: ^10.0.0
+
+  # Runtime build metadata (CFBundleShortVersionString / CFBundleVersion).
+  # Round-8 replaces the earlier --dart-define plumbing because Xcode
+  # archive-from-xcworkspace re-runs the build without those defines and
+  # silently labels every TestFlight build "dev" — see tool/build_release.sh.
+  package_info_plus: ^8.0.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
-
-# device_info_plus 12.4.0 added an isiOSAppOnVision reference that only
-# compiles against the iOS 26.1 SDK (Xcode 26+), breaking builds on older
-# Xcode even though the call itself is @available-guarded at runtime.
-# Pin below 12.4.0 until this is fixed upstream.
-dependency_overrides:
-  device_info_plus: ^12.3.0
 
 flutter:
   uses-material-design: true

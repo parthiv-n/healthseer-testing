@@ -1,4 +1,4 @@
-package com.tikcare.lifepulse_test_app
+package com.tikcare.vitametric
 
 import io.flutter.embedding.android.FlutterActivity
 

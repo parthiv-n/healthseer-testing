@@ -12,6 +12,15 @@ class AnomalyItem {
   final double confidence;
   final String explanation;
   final DateTime detectedAt;
+  // "personal" — anomaly was scored against this user's own baseline
+  // (≥14 days of recordings); "community" — scored against the ACC/AHA /
+  // WHO / NHANES population reference because the user hasn't crossed the
+  // threshold yet; null — fired by a hard-coded clinical safe-range gate
+  // (e.g. SpO2 < 90% regardless of baseline). Drives the explanation copy
+  // so we never claim "your personal baseline" when it was actually a
+  // population reference.
+  final String? baselineSource;
+  final int? baselineSampleCount;
 
   AnomalyItem({
     required this.id,
@@ -23,6 +32,8 @@ class AnomalyItem {
     required this.confidence,
     required this.explanation,
     required this.detectedAt,
+    this.baselineSource,
+    this.baselineSampleCount,
   });
 
   factory AnomalyItem.fromJson(Map<String, dynamic> j) => AnomalyItem(
@@ -41,7 +52,14 @@ class AnomalyItem {
         detectedAt: j['detected_at'] != null
             ? (DateTime.tryParse(j['detected_at'] as String) ?? DateTime.utc(1970)).toLocal()
             : DateTime.utc(1970).toLocal(),
+        baselineSource: j['baseline_source'] as String?,
+        baselineSampleCount: (j['baseline_sample_count'] as num?)?.toInt(),
       );
+
+  /// True when the anomaly was scored against this user's own data
+  /// (≥14 days). False when the comparator is a population reference or
+  /// a hard-coded clinical gate. UI copy should distinguish.
+  bool get isPersonalBaseline => baselineSource == 'personal';
 
   // v3.0 metric labels — 14 supported types
   String get metricLabel => switch (metricType) {

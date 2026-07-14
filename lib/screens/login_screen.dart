@@ -103,7 +103,7 @@ class _LoginScreenState extends State<LoginScreen> {
               const SizedBox(height: 20),
               const Center(
                 child: Text(
-                  'TikCare LifePulse',
+                  'Vitametric',
                   style: TextStyle(
                     fontSize: 24,
                     fontWeight: FontWeight.w800,
@@ -224,7 +224,7 @@ class _LoginScreenState extends State<LoginScreen> {
               const SizedBox(height: 12),
               const Center(
                 child: Text(
-                  'Your data is encrypted and only shared\nwith your insurance provider.',
+                  'Your data is encrypted and stays private.',
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 11, color: Colors.grey),
                 ),

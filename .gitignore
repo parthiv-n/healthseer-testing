@@ -32,6 +32,10 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+# iOS Xcode build cache (regenerated on each build — never commit)
+ios/build/
+# iOS Pods directory (reproduced from Podfile.lock — never commit)
+ios/Pods/
 
 # Symbolication related
 app.*.symbols

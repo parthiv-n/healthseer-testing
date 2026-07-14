@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>TikCare LifePulse</string>
+	<string>TikCare Vitametric</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>TikCare LifePulse</string>
+	<string>TikCare Vitametric</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -52,9 +52,9 @@
 
 	<!-- HealthKit permissions (required by Apple App Review) -->
 	<key>NSHealthShareUsageDescription</key>
-	<string>TikCare LifePulse reads your health data to calculate a health risk score for your insurance plan.</string>
+	<string>TikCare Vitametric reads your health data to calculate a health risk score for your insurance plan.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>TikCare LifePulse may save activity summaries to Apple Health for your reference.</string>
+	<string>TikCare Vitametric may save activity summaries to Apple Health for your reference.</string>
 
 	<!-- Background sync -->
 	<key>UIBackgroundModes</key>
@@ -64,7 +64,7 @@
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>lifepulse.periodicSync</string>
+		<string>vitametric.periodicSync</string>
 	</array>
 </dict>
 </plist>

@@ -99,7 +99,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Text(
-                'Join TikCare LifePulse',
+                'Join Vitametric',
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: kNavy),
               ),
               const SizedBox(height: 6),
